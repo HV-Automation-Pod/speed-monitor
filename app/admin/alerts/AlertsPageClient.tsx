@@ -47,6 +47,8 @@ export default function AlertsPageClient({
   const [rules, setRules] = useState<AlertConfig[]>(initialRules)
   const [deletingId, setDeletingId] = useState<number | null>(null)
   const [deleteError, setDeleteError] = useState<string | null>(null)
+  const [testingId, setTestingId] = useState<number | null>(null)
+  const [testError, setTestError] = useState<string | null>(null)
 
   async function handleDelete(id: number) {
     setDeletingId(id)
@@ -66,6 +68,28 @@ export default function AlertsPageClient({
       setDeleteError(err instanceof Error ? err.message : 'Unknown error')
     } finally {
       setDeletingId(null)
+    }
+  }
+
+  async function handleTestAlert(id: number) {
+    setTestingId(id)
+    setTestError(null)
+    try {
+      const res = await fetch('/api/alerts/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config_id: id }),
+      })
+      if (!res.ok) {
+        const json = await res.json().catch(() => ({}))
+        throw new Error((json as { error?: string }).error ?? 'Failed to send test alert')
+      }
+      // Refresh server component so alert history table shows the new row
+      router.refresh()
+    } catch (err) {
+      setTestError(err instanceof Error ? err.message : 'Unknown error')
+    } finally {
+      setTestingId(null)
     }
   }
 
@@ -95,9 +119,9 @@ export default function AlertsPageClient({
             <h2 className="text-base font-semibold text-gray-900">Active Rules</h2>
           </div>
 
-          {deleteError && (
+          {(deleteError || testError) && (
             <div className="mx-6 mt-4 px-3 py-2 bg-red-50 border border-red-200 rounded-md text-sm text-red-700">
-              {deleteError}
+              {deleteError || testError}
             </div>
           )}
 
@@ -153,13 +177,22 @@ export default function AlertsPageClient({
                         {new Date(rule.created_at).toLocaleDateString()}
                       </td>
                       <td className="px-4 py-3 text-right">
-                        <button
-                          onClick={() => handleDelete(rule.id)}
-                          disabled={deletingId === rule.id}
-                          className="text-xs text-red-600 hover:text-red-800 disabled:opacity-50 transition-colors"
-                        >
-                          {deletingId === rule.id ? 'Deleting…' : 'Delete'}
-                        </button>
+                        <div className="flex items-center justify-end gap-3">
+                          <button
+                            onClick={() => handleTestAlert(rule.id)}
+                            disabled={testingId === rule.id}
+                            className="text-xs text-blue-600 hover:text-blue-800 disabled:opacity-50 transition-colors"
+                          >
+                            {testingId === rule.id ? 'Sending…' : 'Test'}
+                          </button>
+                          <button
+                            onClick={() => handleDelete(rule.id)}
+                            disabled={deletingId === rule.id}
+                            className="text-xs text-red-600 hover:text-red-800 disabled:opacity-50 transition-colors"
+                          >
+                            {deletingId === rule.id ? 'Deleting…' : 'Delete'}
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   ))}
