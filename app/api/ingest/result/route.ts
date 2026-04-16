@@ -170,6 +170,7 @@ export async function POST(request: Request) {
     data.download_mbps ?? null,
     data.upload_mbps ?? null,
     data.latency_ms ?? null,
+    data.hostname ?? null,
   )
 
   return NextResponse.json({ ok: true }, { status: 202 })
@@ -192,6 +193,7 @@ async function checkAlertThresholds(
   download: number | null,
   upload: number | null,
   latency: number | null,
+  hostname?: string | null,
 ): Promise<void> {
   try {
     const { data: configs, error } = await supabaseAdmin
