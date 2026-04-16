@@ -30,7 +30,7 @@ export default function ShareButton({ deviceId }: { deviceId: string }) {
         Share with IT
       </button>
       {copied && (
-        <span className="absolute -top-9 left-1/2 -translate-x-1/2 bg-gray-900 text-white text-xs px-3 py-1.5 rounded-lg whitespace-nowrap pointer-events-none">
+        <span className="absolute top-full mt-2 left-1/2 -translate-x-1/2 bg-gray-900 text-white text-xs px-3 py-1.5 rounded-lg whitespace-nowrap pointer-events-none z-10">
           Link copied
         </span>
       )}
