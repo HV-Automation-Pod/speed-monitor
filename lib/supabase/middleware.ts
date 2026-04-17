@@ -35,11 +35,15 @@ export async function updateSession(request: NextRequest) {
   // - /auth/* (OAuth callback route)
   // - /api/ingest/* (device API — authenticated via X-Api-Key, not session)
   // - /api/commands/* (device API — authenticated via X-Api-Key, not session)
+  // - /setup (public installation guide for IT admins and contractors)
+  // - /api/download (pkg download redirect — must be accessible to IT/Jamf without login)
   const isPublicRoute =
     pathname === '/' ||
     pathname.startsWith('/auth/') ||
     pathname.startsWith('/api/ingest/') ||
-    pathname.startsWith('/api/commands/')
+    pathname.startsWith('/api/commands/') ||
+    pathname === '/setup' ||
+    pathname === '/api/download'
 
   if (!user && !isPublicRoute) {
     const url = request.nextUrl.clone()
