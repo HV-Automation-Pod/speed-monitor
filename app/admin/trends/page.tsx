@@ -223,19 +223,23 @@ export default async function TrendsPage({
 
   return (
     <div className="p-8">
-      <h1 className="text-2xl font-bold text-gray-900 mb-6">Speed Trends</h1>
+      {/* Page header */}
+      <div className="mb-6">
+        <h1 className="text-2xl font-bold text-gray-900">Trends</h1>
+        <p className="text-sm text-gray-500 mt-1">Fleet-wide speed patterns and analytics</p>
+      </div>
 
-      {/* Day range selector */}
-      <div className="flex gap-2 mb-8">
+      {/* Day range selector — toggle button group matching DeviceSpeedChart pattern */}
+      <div className="flex rounded-md border border-gray-200 overflow-hidden w-fit mb-8">
         {VALID_DAYS.map((d) => (
           <Link
             key={d}
             href={`?days=${d}`}
-            className={
+            className={`px-3 py-1.5 text-sm font-medium transition-colors ${
               d === days
-                ? 'px-4 py-1.5 text-sm rounded-md font-bold border-b-2 border-blue-500 text-blue-600 bg-blue-50'
-                : 'px-4 py-1.5 text-sm rounded-md text-gray-600 hover:text-gray-900 hover:bg-gray-100 transition-colors'
-            }
+                ? 'bg-indigo-600 text-white'
+                : 'bg-white text-gray-600 hover:bg-gray-50'
+            }`}
           >
             {d}d
           </Link>
@@ -243,30 +247,23 @@ export default async function TrendsPage({
       </div>
 
       {/* Fleet Download & Upload chart */}
-      <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6 mb-6">
-        <h2 className="text-base font-semibold text-gray-900 mb-4">
-          Fleet Download &amp; Upload
-        </h2>
+      <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-6 mb-6">
+        <h2 className="text-base font-semibold text-gray-900 mb-1">Fleet Speed Trends</h2>
+        <p className="text-xs text-gray-400 mb-4">Fleet avg download + upload · {days}-day window</p>
         <TrendsChart data={trendsData} />
       </div>
 
       {/* Time of Day heatmap */}
-      <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6 mb-6">
-        <h2 className="text-base font-semibold text-gray-900 mb-4">
-          Average Speed by Time of Day
-        </h2>
+      <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-6 mb-6">
+        <h2 className="text-base font-semibold text-gray-900 mb-1">Performance by Hour of Day</h2>
+        <p className="text-xs text-gray-400 mb-4">Average download speed per hour · {days}-day window · UTC</p>
         <TimeOfDayHeatmap data={timeOfDayData} />
-        <p className="mt-3 text-xs text-gray-400">
-          Hours shown in UTC. Each cell represents the average download speed
-          recorded during that hour across all devices.
-        </p>
       </div>
 
       {/* WiFi Analytics */}
-      <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6 mb-6">
-        <h2 className="text-base font-semibold text-gray-900 mb-4">
-          WiFi Analytics
-        </h2>
+      <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-6 mb-6">
+        <h2 className="text-base font-semibold text-gray-900 mb-1">WiFi Analytics</h2>
+        <p className="text-xs text-gray-400 mb-4">Band distribution and top SSIDs · {days}-day window</p>
         <WifiBandChart
           bandDistribution={wifiStats.bandDistribution}
           topSsids={wifiStats.topSsids}
@@ -274,10 +271,9 @@ export default async function TrendsPage({
       </div>
 
       {/* VPN Analytics */}
-      <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-        <h2 className="text-base font-semibold text-gray-900 mb-4">
-          VPN Analytics
-        </h2>
+      <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-6">
+        <h2 className="text-base font-semibold text-gray-900 mb-1">VPN Analytics</h2>
+        <p className="text-xs text-gray-400 mb-4">Speed comparison by VPN status · {days}-day window</p>
         <VpnStatsSection
           distribution={vpnStats.distribution}
           avgByStatus={vpnStats.avgByStatus}
