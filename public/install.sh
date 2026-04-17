@@ -29,10 +29,16 @@ log "Starting SpeedMonitor v4.0.0 installation..."
 
 # 0. Stop and clean up any previous installation
 log "Stopping previous installation (if any)..."
+# Kill running app (any location)
 killall SpeedMonitor 2>/dev/null || true
+# Unload LaunchAgent (current user)
 launchctl unload "$PLIST" 2>/dev/null || true
-# Also unload old system-level daemon if it exists
-sudo launchctl unload /Library/LaunchDaemons/com.speedmonitor.plist 2>/dev/null || true
+# Unload old watchdog LaunchAgent (previous versions had a separate watchdog)
+launchctl unload "$LAUNCH_AGENTS/com.speedmonitor.watchdog.plist" 2>/dev/null || true
+# Remove old app from /Applications (previous pkg installed here)
+rm -rf /Applications/SpeedMonitor.app 2>/dev/null || true
+# Remove old app from ~/Applications in case of partial previous run
+rm -rf "$APP_DEST" 2>/dev/null || true
 
 # 1. Create directories
 mkdir -p "$CONFIG_DIR" "$BIN_DIR" "$DATA_DIR" "$LAUNCH_AGENTS" "$HOME/Applications"
