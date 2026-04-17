@@ -10,15 +10,15 @@ const ResultPayload = z.object({
 
 export async function POST(
   request: Request,
-  { params }: { params: Promise<{ id: string }> }
+  { params }: { params: Promise<{ device_id: string }> }
 ) {
   const auth = await validateApiKey(request)
   if (!auth) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  const { id } = await params
-  const commandId = parseInt(id, 10)
+  const { device_id } = await params
+  const commandId = parseInt(device_id, 10)
   if (isNaN(commandId)) {
     return NextResponse.json({ error: 'Invalid command id' }, { status: 400 })
   }
