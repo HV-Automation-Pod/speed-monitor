@@ -43,7 +43,21 @@ rm -rf "$APP_DEST" 2>/dev/null || true
 # 1. Create directories
 mkdir -p "$CONFIG_DIR" "$BIN_DIR" "$DATA_DIR" "$LAUNCH_AGENTS" "$HOME/Applications"
 
-# 2. Download speed_monitor.sh
+# 2. Install Homebrew + speedtest-cli if missing
+if ! command -v speedtest-cli &>/dev/null; then
+    log "Installing speedtest-cli..."
+    if ! command -v brew &>/dev/null; then
+        log "Installing Homebrew..."
+        NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        # Add Homebrew to PATH for this session
+        eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || eval "$(/usr/local/bin/brew shellenv)" 2>/dev/null || true
+    fi
+    brew install speedtest-cli --quiet 2>/dev/null || log "WARNING: speedtest-cli install failed — speeds will use Cloudflare fallback"
+else
+    log "speedtest-cli already installed"
+fi
+
+# 2b. Download speed_monitor.sh
 log "Downloading speed_monitor.sh..."
 curl -fsSL "$SERVER_URL/speed_monitor.sh" -o "$BIN_DIR/speed_monitor.sh"
 chmod +x "$BIN_DIR/speed_monitor.sh"
