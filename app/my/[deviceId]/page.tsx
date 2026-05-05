@@ -20,13 +20,14 @@ export default async function MyDevicePage({
   const { data: { user } } = await supabase.auth.getUser()
   if (!user) redirect('/')
 
-  // Ownership check — verify this employee is mapped to deviceId
+  // Ownership check — verify this employee has results posted for this deviceId
   // Prevents any authenticated @hyperverge.co user from viewing another employee's data
   const { data: ownership } = await supabaseAdmin
-    .from('device_user_map')
+    .from('speed_results')
     .select('device_id')
     .eq('device_id', deviceId)
     .eq('user_email', user.email)
+    .limit(1)
     .maybeSingle()
   if (!ownership) redirect('/my')
 
