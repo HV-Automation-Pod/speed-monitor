@@ -10,13 +10,15 @@ export default async function MyPage() {
   const { data: { user } } = await supabase.auth.getUser()
   if (!user) redirect('/')
 
-  // Look up devices registered to this employee via device_user_map
+  // Look up devices that have posted results tagged with this email
   const { data: mappings } = await supabaseAdmin
-    .from('device_user_map')
+    .from('speed_results')
     .select('device_id')
     .eq('user_email', user.email)
+    .order('timestamp_utc', { ascending: false })
+    .limit(500)
 
-  const deviceIds = (mappings ?? []).map((m: { device_id: string }) => m.device_id)
+  const deviceIds = [...new Set((mappings ?? []).map((m: { device_id: string }) => m.device_id))]
 
   // Empty state: no devices registered to this email
   if (deviceIds.length === 0) {
