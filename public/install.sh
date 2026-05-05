@@ -14,17 +14,19 @@
 
 set -euo pipefail
 
-# When run as root via Jamf, $HOME is unset or /var/root.
-# Detect the actual logged-in console user and run as them.
-if [[ -z "${HOME:-}" ]] || [[ "${HOME:-}" == "/var/root" ]]; then
+# When run as root via Jamf, Homebrew refuses to install.
+# Re-download the script to a temp file and re-exec as the logged-in console user.
+if [[ "$(id -u)" == "0" ]]; then
     CONSOLE_USER=$(stat -f "%Su" /dev/console 2>/dev/null || echo "")
-    if [[ -n "$CONSOLE_USER" && "$CONSOLE_USER" != "root" ]]; then
-        export HOME="/Users/$CONSOLE_USER"
-        export USER="$CONSOLE_USER"
-    else
-        echo "[SpeedMonitor install] ERROR: Could not detect logged-in user. Run as the target user, not root." >&2
+    if [[ -z "$CONSOLE_USER" || "$CONSOLE_USER" == "root" ]]; then
+        echo "[SpeedMonitor install] ERROR: No user logged in at console. Deploy when a user is active." >&2
         exit 1
     fi
+    echo "[SpeedMonitor install] Running as root — re-launching as $CONSOLE_USER..."
+    TMP=$(mktemp /tmp/speedmonitor_install_XXXXXX.sh)
+    curl -fsSL "https://speed-monitor-six.vercel.app/install.sh" -o "$TMP"
+    chmod 755 "$TMP"
+    exec sudo -u "$CONSOLE_USER" HOME="/Users/$CONSOLE_USER" USER="$CONSOLE_USER" /bin/bash "$TMP"
 fi
 
 SERVER_URL="https://speed-monitor-six.vercel.app"
