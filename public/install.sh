@@ -53,6 +53,22 @@ log "speed_monitor.sh installed to $BIN_DIR/"
 printf '%s\n' "$SERVER_URL" > "$CONFIG_DIR/server_url"
 log "server_url set to $SERVER_URL"
 
+# 3a. Detect user email from signed-in Apple ID
+APPLE_ID=$(python3 -c "
+import subprocess, re
+out = subprocess.run(['defaults', 'read', 'MobileMeAccounts', 'Accounts'],
+                     capture_output=True, text=True).stdout
+m = re.search(r'AccountID\s*=\s*\"([^\"]+)\"', out)
+print(m.group(1) if m else '')
+" 2>/dev/null || true)
+
+if [[ -n "$APPLE_ID" ]]; then
+    printf '%s\n' "$APPLE_ID" > "$CONFIG_DIR/user_email"
+    log "user_email set from Apple ID: $APPLE_ID"
+else
+    log "WARNING: Could not detect Apple ID — user_email not set. Employee portal will not link to this device."
+fi
+
 # 4. Download and install SpeedMonitor.app
 log "Downloading SpeedMonitor.app..."
 TMP_ZIP=$(mktemp /tmp/SpeedMonitor-XXXXXX.zip)
