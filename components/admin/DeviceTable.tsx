@@ -21,6 +21,7 @@ interface DeviceTableProps {
   devices: DeviceRow[]
   sort: string
   order: string
+  fleetAvg?: number | null  // fleet 24h avg download Mbps — optional, column hidden when null
 }
 
 const HEALTH_HEX: Record<HealthStatus, string> = {
@@ -150,7 +151,7 @@ function DeleteButton({ deviceId, hostname }: { deviceId: string; hostname: stri
   )
 }
 
-export default function DeviceTable({ devices, sort, order }: DeviceTableProps) {
+export default function DeviceTable({ devices, sort, order, fleetAvg = null }: DeviceTableProps) {
   const router = useRouter()
   const [search, setSearch] = useState('')
   const [healthFilter, setHealthFilter] = useState<FilterHealth>('all')
@@ -278,6 +279,11 @@ export default function DeviceTable({ devices, sort, order }: DeviceTableProps) 
                     <SortIcon active={sort === key} order={order} />
                   </th>
                 ))}
+                {fleetAvg != null && (
+                  <th className="px-3 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    vs Fleet
+                  </th>
+                )}
                 <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide w-20">
                   Actions
                 </th>
@@ -331,6 +337,23 @@ export default function DeviceTable({ devices, sort, order }: DeviceTableProps) 
                       ? <><span className="font-medium">{device.download_mbps.toFixed(1)}</span><span className="text-gray-400 text-xs ml-0.5">Mbps</span></>
                       : <span className="text-gray-300">—</span>}
                   </td>
+
+                  {/* vs Fleet */}
+                  {fleetAvg != null && (
+                    <td className="px-3 py-3 text-right tabular-nums text-xs font-medium whitespace-nowrap">
+                      {(() => {
+                        const dl = device.download_mbps
+                        if (dl == null || fleetAvg === 0) return <span className="text-gray-400">—</span>
+                        const pct = Math.round(((dl - fleetAvg) / fleetAvg) * 100)
+                        const isAbove = pct >= 0
+                        return (
+                          <span style={{ color: isAbove ? '#15803d' : '#b91c1c' }}>
+                            {isAbove ? '+' : ''}{pct}%
+                          </span>
+                        )
+                      })()}
+                    </td>
+                  )}
 
                   {/* Upload */}
                   <td className="px-4 py-3 text-right tabular-nums text-gray-700">

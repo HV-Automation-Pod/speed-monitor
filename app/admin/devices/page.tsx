@@ -174,6 +174,15 @@ export default async function DevicesPage({
     return 0
   })
 
+  // Compute fleet avg download from last 24h data (already fetched in rawResults)
+  const since24hMs = Date.now() - 24 * 60 * 60 * 1000
+  const recent24h = (rawResults ?? []).filter(
+    (r) => r.timestamp_utc && new Date(r.timestamp_utc).getTime() >= since24hMs && r.download_mbps != null
+  )
+  const fleetAvg = recent24h.length > 0
+    ? Math.round((recent24h.reduce((sum, r) => sum + (r.download_mbps ?? 0), 0) / recent24h.length) * 100) / 100
+    : null
+
   const criticalCount = devices.filter((d) => d.health === 'red').length
   const warningCount  = devices.filter((d) => d.health === 'yellow').length
 
@@ -195,7 +204,7 @@ export default async function DevicesPage({
       </div>
 
       <div className="bg-white rounded-xl shadow-sm border border-gray-200">
-        <DeviceTable devices={devices} sort={sort} order={order} />
+        <DeviceTable devices={devices} sort={sort} order={order} fleetAvg={fleetAvg} />
       </div>
 
       {/* High Jitter Devices */}
