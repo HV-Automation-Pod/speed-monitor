@@ -15,6 +15,8 @@ export interface DeviceRow {
   timestamp_utc: string | null
   band: string | null
   vpn_status: string | null
+  ssid: string | null
+  user_email: string | null
 }
 
 interface DeviceTableProps {
@@ -65,6 +67,7 @@ const SORTABLE_COLUMNS: Array<{ key: string; label: string; align?: 'right' }> =
   { key: 'upload_mbps',   label: 'Upload',   align: 'right' },
   { key: 'latency_ms',    label: 'Latency',  align: 'right' },
   { key: 'band',          label: 'Band' },
+  { key: 'ssid',          label: 'SSID' },
   { key: 'vpn_status',    label: 'VPN' },
 ]
 
@@ -155,6 +158,16 @@ export default function DeviceTable({ devices, sort, order, fleetAvg = null }: D
   const router = useRouter()
   const [search, setSearch] = useState('')
   const [healthFilter, setHealthFilter] = useState<FilterHealth>('all')
+  const [ssidFilter, setSsidFilter] = useState<string>('all')
+
+  // Unique SSIDs for the dropdown
+  const ssidOptions = useMemo(() => {
+    const set = new Set<string>()
+    for (const d of devices) {
+      if (d.ssid) set.add(d.ssid)
+    }
+    return Array.from(set).sort()
+  }, [devices])
 
   // Count per health status for filter pills
   const healthCounts = useMemo(() => {
@@ -163,18 +176,20 @@ export default function DeviceTable({ devices, sort, order, fleetAvg = null }: D
     return counts
   }, [devices])
 
-  // Apply search + health filter client-side
+  // Apply search + health + SSID filter client-side
   const filtered = useMemo(() => {
     return devices.filter((d) => {
       if (healthFilter !== 'all' && d.health !== healthFilter) return false
+      if (ssidFilter !== 'all' && d.ssid !== ssidFilter) return false
       if (search.trim()) {
         const q = search.trim().toLowerCase()
         const name = (d.hostname ?? d.device_id).toLowerCase()
-        if (!name.includes(q)) return false
+        const email = (d.user_email ?? '').toLowerCase()
+        if (!name.includes(q) && !email.includes(q)) return false
       }
       return true
     })
-  }, [devices, search, healthFilter])
+  }, [devices, search, healthFilter, ssidFilter])
 
   function handleSort(column: string) {
     const newOrder = sort === column && order === 'desc' ? 'asc' : 'desc'
@@ -200,7 +215,7 @@ export default function DeviceTable({ devices, sort, order, fleetAvg = null }: D
           </svg>
           <input
             type="text"
-            placeholder="Search by hostname…"
+            placeholder="Search by name or email…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="w-full pl-8 pr-3 py-1.5 text-sm border border-gray-200 rounded-lg bg-gray-50 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
@@ -243,8 +258,30 @@ export default function DeviceTable({ devices, sort, order, fleetAvg = null }: D
           })}
         </div>
 
+        {/* SSID filter dropdown */}
+        {ssidOptions.length > 0 && (
+          <div className="relative">
+            <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-400 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.14 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0" />
+            </svg>
+            <select
+              value={ssidFilter}
+              onChange={(e) => setSsidFilter(e.target.value)}
+              className="pl-7 pr-7 py-1.5 text-xs border border-gray-200 rounded-lg bg-gray-50 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent appearance-none cursor-pointer text-gray-700"
+            >
+              <option value="all">All SSIDs</option>
+              {ssidOptions.map((s) => (
+                <option key={s} value={s}>{s}</option>
+              ))}
+            </select>
+            <svg className="absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-gray-400 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+            </svg>
+          </div>
+        )}
+
         {/* Result count when filtered */}
-        {(search || healthFilter !== 'all') && (
+        {(search || healthFilter !== 'all' || ssidFilter !== 'all') && (
           <span className="text-xs text-gray-400 ml-auto">
             {filtered.length} of {devices.length}
           </span>
@@ -258,7 +295,7 @@ export default function DeviceTable({ devices, sort, order, fleetAvg = null }: D
           </svg>
           <p className="text-sm font-medium text-gray-500">No devices match your filters</p>
           <button
-            onClick={() => { setSearch(''); setHealthFilter('all') }}
+            onClick={() => { setSearch(''); setHealthFilter('all'); setSsidFilter('all') }}
             className="mt-2 text-xs text-indigo-600 hover:underline"
           >
             Clear filters
@@ -305,6 +342,11 @@ export default function DeviceTable({ devices, sort, order, fleetAvg = null }: D
                           </span>
                         )}
                       </span>
+                      {device.user_email && (
+                        <span className="block text-xs text-gray-400 mt-0.5">
+                          {device.user_email}
+                        </span>
+                      )}
                     </Link>
                   </td>
 
@@ -338,23 +380,6 @@ export default function DeviceTable({ devices, sort, order, fleetAvg = null }: D
                       : <span className="text-gray-300">—</span>}
                   </td>
 
-                  {/* vs Fleet */}
-                  {fleetAvg != null && (
-                    <td className="px-3 py-3 text-right tabular-nums text-xs font-medium whitespace-nowrap">
-                      {(() => {
-                        const dl = device.download_mbps
-                        if (dl == null || fleetAvg === 0) return <span className="text-gray-400">—</span>
-                        const pct = Math.round(((dl - fleetAvg) / fleetAvg) * 100)
-                        const isAbove = pct >= 0
-                        return (
-                          <span style={{ color: isAbove ? '#15803d' : '#b91c1c' }}>
-                            {isAbove ? '+' : ''}{pct}%
-                          </span>
-                        )
-                      })()}
-                    </td>
-                  )}
-
                   {/* Upload */}
                   <td className="px-4 py-3 text-right tabular-nums text-gray-700">
                     {device.upload_mbps != null
@@ -378,6 +403,25 @@ export default function DeviceTable({ devices, sort, order, fleetAvg = null }: D
                     )}
                   </td>
 
+                  {/* SSID */}
+                  <td className="px-4 py-3 text-xs text-gray-600 max-w-[140px]">
+                    {device.ssid ? (
+                      <button
+                        onClick={() => setSsidFilter(ssidFilter === device.ssid ? 'all' : device.ssid!)}
+                        title={`Filter by ${device.ssid}`}
+                        className={`px-1.5 py-0.5 rounded font-medium truncate max-w-full block transition-colors ${
+                          ssidFilter === device.ssid
+                            ? 'bg-indigo-100 text-indigo-700'
+                            : 'bg-gray-100 text-gray-600 hover:bg-indigo-50 hover:text-indigo-600'
+                        }`}
+                      >
+                        {device.ssid}
+                      </button>
+                    ) : (
+                      <span className="text-gray-300">—</span>
+                    )}
+                  </td>
+
                   {/* VPN */}
                   <td className="px-4 py-3">
                     {device.vpn_status == null ? (
@@ -391,6 +435,23 @@ export default function DeviceTable({ devices, sort, order, fleetAvg = null }: D
                       <span className="text-xs text-gray-400 capitalize">{device.vpn_status}</span>
                     )}
                   </td>
+
+                  {/* vs Fleet */}
+                  {fleetAvg != null && (
+                    <td className="px-3 py-3 text-right tabular-nums text-xs font-medium whitespace-nowrap">
+                      {(() => {
+                        const dl = device.download_mbps
+                        if (dl == null || fleetAvg === 0) return <span className="text-gray-400">—</span>
+                        const pct = Math.round(((dl - fleetAvg) / fleetAvg) * 100)
+                        const isAbove = pct >= 0
+                        return (
+                          <span style={{ color: isAbove ? '#15803d' : '#b91c1c' }}>
+                            {isAbove ? '+' : ''}{pct}%
+                          </span>
+                        )
+                      })()}
+                    </td>
+                  )}
 
                   {/* Actions */}
                   <td className="px-4 py-3">

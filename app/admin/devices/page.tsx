@@ -5,7 +5,7 @@ import JitterProblemDevices from '@/components/admin/JitterProblemDevices'
 
 export const dynamic = 'force-dynamic'
 
-type ValidSortColumn = 'download_mbps' | 'upload_mbps' | 'latency_ms' | 'timestamp_utc' | 'hostname' | 'band' | 'vpn_status'
+type ValidSortColumn = 'download_mbps' | 'upload_mbps' | 'latency_ms' | 'timestamp_utc' | 'hostname' | 'band' | 'vpn_status' | 'ssid'
 
 const VALID_SORT_COLUMNS: ValidSortColumn[] = [
   'download_mbps',
@@ -15,6 +15,7 @@ const VALID_SORT_COLUMNS: ValidSortColumn[] = [
   'hostname',
   'band',
   'vpn_status',
+  'ssid',
 ]
 
 interface SearchParams {
@@ -22,6 +23,20 @@ interface SearchParams {
   order?: string
   vpn?: string
   band?: string
+  ssid?: string
+}
+
+interface LatestDeviceRow {
+  device_id: string
+  hostname: string | null
+  download_mbps: number | null
+  upload_mbps: number | null
+  latency_ms: number | null
+  timestamp_utc: string | null
+  band: string | null
+  vpn_status: string | null
+  ssid: string | null
+  user_email: string | null
 }
 
 async function getJitterStats() {
@@ -76,24 +91,17 @@ export default async function DevicesPage({
   const order = params.order === 'asc' ? 'asc' : 'desc'
   const vpnFilter = params.vpn
   const bandFilter = params.band
+  const ssidFilter = params.ssid
 
-  // Fetch latest result per device: get recent 2000 rows and dedup in JS
-  // (DISTINCT ON not available via JS Supabase client)
-  let query = supabaseAdmin
-    .from('speed_results')
-    .select('device_id, hostname, download_mbps, upload_mbps, latency_ms, timestamp_utc, band, vpn_status')
-    .order('timestamp_utc', { ascending: false })
-    .limit(2000)
+  // Use DISTINCT ON via RPC so every device appears regardless of how long it's been offline.
+  // The composite index on (device_id, timestamp_utc DESC) makes this fast.
+  let rpcQuery = supabaseAdmin.rpc('get_latest_per_device')
+  if (vpnFilter) rpcQuery = rpcQuery.eq('vpn_status', vpnFilter)
+  if (bandFilter) rpcQuery = rpcQuery.eq('band', bandFilter)
+  if (ssidFilter) rpcQuery = rpcQuery.eq('ssid', ssidFilter)
 
-  if (vpnFilter) {
-    query = query.eq('vpn_status', vpnFilter)
-  }
-  if (bandFilter) {
-    query = query.eq('band', bandFilter)
-  }
-
-  const [{ data: rawResults }, { data: baselines }, jitterStats] = await Promise.all([
-    query,
+  const [rpcResult, { data: baselines }, jitterStats] = await Promise.all([
+    rpcQuery,
     supabaseAdmin
       .from('device_baselines')
       .select('device_id, mean, std_dev')
@@ -101,25 +109,7 @@ export default async function DevicesPage({
     getJitterStats(),
   ])
 
-  // Dedup to latest per device
-  const seen = new Set<string>()
-  const lastPerDevice: Array<{
-    device_id: string
-    hostname: string | null
-    download_mbps: number | null
-    upload_mbps: number | null
-    latency_ms: number | null
-    timestamp_utc: string | null
-    band: string | null
-    vpn_status: string | null
-  }> = []
-
-  for (const row of rawResults ?? []) {
-    if (!seen.has(row.device_id)) {
-      seen.add(row.device_id)
-      lastPerDevice.push(row)
-    }
-  }
+  const lastPerDevice: LatestDeviceRow[] = (rpcResult.data as LatestDeviceRow[] | null) ?? []
 
   const baselineMap = new Map(
     (baselines ?? []).map((b) => [b.device_id, b])
@@ -144,6 +134,8 @@ export default async function DevicesPage({
       timestamp_utc: r.timestamp_utc,
       band: r.band,
       vpn_status: r.vpn_status,
+      ssid: r.ssid,
+      user_email: r.user_email,
     }
   })
 
@@ -164,6 +156,9 @@ export default async function DevicesPage({
     } else if (sort === 'vpn_status') {
       aVal = a.vpn_status ?? ''
       bVal = b.vpn_status ?? ''
+    } else if (sort === 'ssid') {
+      aVal = a.ssid ?? ''
+      bVal = b.ssid ?? ''
     } else {
       aVal = a[sort as 'download_mbps' | 'upload_mbps' | 'latency_ms'] ?? 0
       bVal = b[sort as 'download_mbps' | 'upload_mbps' | 'latency_ms'] ?? 0
@@ -174,13 +169,13 @@ export default async function DevicesPage({
     return 0
   })
 
-  // Compute fleet avg download from last 24h data (already fetched in rawResults)
+  // Fleet avg: average latest download across devices active in the last 24h
   const since24hMs = Date.now() - 24 * 60 * 60 * 1000
-  const recent24h = (rawResults ?? []).filter(
+  const activeDevices = (lastPerDevice ?? []).filter(
     (r) => r.timestamp_utc && new Date(r.timestamp_utc).getTime() >= since24hMs && r.download_mbps != null
   )
-  const fleetAvg = recent24h.length > 0
-    ? Math.round((recent24h.reduce((sum, r) => sum + (r.download_mbps ?? 0), 0) / recent24h.length) * 100) / 100
+  const fleetAvg = activeDevices.length > 0
+    ? Math.round((activeDevices.reduce((sum, r) => sum + (r.download_mbps ?? 0), 0) / activeDevices.length) * 100) / 100
     : null
 
   const criticalCount = devices.filter((d) => d.health === 'red').length

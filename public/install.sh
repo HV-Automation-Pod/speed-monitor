@@ -10,7 +10,7 @@
 #   5. Provisions an API key from the server
 #   6. Writes device_id and api_key to ~/.config/nkspeedtest/
 #   7. Installs and loads the LaunchAgent (runs speed test every 10 min)
-#   8. Launches SpeedMonitor.app
+#   8. Installs and loads the app LaunchAgent (auto-starts app at login)
 
 set -euo pipefail
 
@@ -35,9 +35,11 @@ if [[ "$(id -u)" == "0" ]]; then
     echo "[SpeedMonitor install] Running as root — re-launching as $CONSOLE_USER..."
     rm -f /tmp/speedmonitor_install_* 2>/dev/null || true  # clean up any stale temp files
     TMP=$(mktemp /tmp/speedmonitor_install_XXXXXX)         # no suffix — macOS mktemp requires X's at end
-    curl -fsSL "https://speed-monitor-six.vercel.app/install.sh" -o "$TMP"
+    curl -fsSL --retry 3 --retry-delay 2 "https://speed-monitor-six.vercel.app/install.sh" -o "$TMP"
     chmod 755 "$TMP"
-    exec sudo -u "$CONSOLE_USER" HOME="/Users/$CONSOLE_USER" USER="$CONSOLE_USER" /bin/bash "$TMP"
+    USER_UID=$(id -u "$CONSOLE_USER")
+    # launchctl asuser establishes the full login session context (required for ~/Library access in Jamf)
+    exec launchctl asuser "$USER_UID" sudo -u "$CONSOLE_USER" HOME="/Users/$CONSOLE_USER" USER="$CONSOLE_USER" /bin/bash "$TMP"
 fi
 
 SERVER_URL="https://speed-monitor-six.vercel.app"
@@ -46,6 +48,7 @@ BIN_DIR="$HOME/.local/bin"
 DATA_DIR="$HOME/.local/share/nkspeedtest"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 PLIST="$LAUNCH_AGENTS/com.speedmonitor.plist"
+APP_PLIST="$LAUNCH_AGENTS/com.speedmonitor.app.plist"
 APP_DEST="$HOME/Applications/SpeedMonitor.app"
 
 log() { echo "[SpeedMonitor install] $*"; }
@@ -55,12 +58,16 @@ log "Starting SpeedMonitor v4.0.0 installation..."
 
 # 0. Stop and clean up any previous installation
 log "Stopping previous installation (if any)..."
-# Kill running app (any location)
+# Kill running app and unload all LaunchAgents (idempotent)
 killall SpeedMonitor 2>/dev/null || true
-# Unload LaunchAgent (current user)
-launchctl unload "$PLIST" 2>/dev/null || true
-# Unload old watchdog LaunchAgent (previous versions had a separate watchdog)
-launchctl unload "$LAUNCH_AGENTS/com.speedmonitor.watchdog.plist" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/com.speedmonitor" 2>/dev/null || \
+    launchctl unload "$PLIST" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/com.speedmonitor.app" 2>/dev/null || \
+    launchctl unload "$APP_PLIST" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/com.speedmonitor.watchdog" 2>/dev/null || \
+    launchctl unload "$LAUNCH_AGENTS/com.speedmonitor.watchdog.plist" 2>/dev/null || true
+# Wait for app process to fully exit before relaunching
+sleep 1
 # Remove old app from /Applications (previous pkg installed here)
 rm -rf /Applications/SpeedMonitor.app 2>/dev/null || true
 # Remove old app from ~/Applications in case of partial previous run
@@ -83,7 +90,7 @@ fi
 
 # 2b. Download speed_monitor.sh
 log "Downloading speed_monitor.sh..."
-curl -fsSL "$SERVER_URL/speed_monitor.sh" -o "$BIN_DIR/speed_monitor.sh"
+curl -fsSL --retry 3 --retry-delay 2 "$SERVER_URL/speed_monitor.sh" -o "$BIN_DIR/speed_monitor.sh"
 chmod +x "$BIN_DIR/speed_monitor.sh"
 log "speed_monitor.sh installed to $BIN_DIR/"
 
@@ -110,7 +117,7 @@ fi
 # 4. Download and install SpeedMonitor.app
 log "Downloading SpeedMonitor.app..."
 TMP_ZIP=$(mktemp /tmp/SpeedMonitor-XXXXXX.zip)
-curl -fsSL "$SERVER_URL/SpeedMonitor.app.zip" -o "$TMP_ZIP"
+curl -fsSL --retry 3 --retry-delay 2 "$SERVER_URL/SpeedMonitor.app.zip" -o "$TMP_ZIP"
 rm -rf "$APP_DEST"
 unzip -q "$TMP_ZIP" -d "$HOME/Applications/"
 rm -f "$TMP_ZIP"
@@ -164,7 +171,7 @@ cat > "$PLIST" << PLIST_EOF
   <array>
     <string>$BIN_DIR/speed_monitor.sh</string>
   </array>
-  <key>StartInterval</key><integer>600</integer>
+  <key>StartInterval</key><integer>1200</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$DATA_DIR/launchd_stdout.log</string>
   <key>StandardErrorPath</key><string>$DATA_DIR/launchd_stderr.log</string>
@@ -182,11 +189,33 @@ launchctl unload "$PLIST" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || \
     launchctl load "$PLIST" 2>/dev/null || \
     log "WARNING: LaunchAgent could not be loaded — speed tests will not run automatically"
-log "LaunchAgent loaded — speed tests will run every 10 minutes"
+log "LaunchAgent loaded — speed tests will run every 20 minutes"
 
-# 8. Launch the new SpeedMonitor.app
-log "Launching SpeedMonitor.app..."
-open "$APP_DEST"
+# 8. Write and load app LaunchAgent (auto-starts SpeedMonitor.app at every login)
+cat > "$APP_PLIST" << APP_PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.speedmonitor.app</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$APP_DEST/Contents/MacOS/SpeedMonitor</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$DATA_DIR/app_stdout.log</string>
+  <key>StandardErrorPath</key><string>$DATA_DIR/app_stderr.log</string>
+</dict>
+</plist>
+APP_PLIST_EOF
+
+launchctl bootout "gui/$(id -u)/com.speedmonitor.app" 2>/dev/null || \
+    launchctl unload "$APP_PLIST" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$APP_PLIST" 2>/dev/null || \
+    launchctl load "$APP_PLIST" 2>/dev/null || \
+    log "WARNING: App LaunchAgent could not be loaded — open ~/Applications/SpeedMonitor.app manually"
+log "App LaunchAgent loaded — SpeedMonitor.app will start automatically at every login"
 
 echo ""
 echo "SpeedMonitor v4.0.0 installation complete."
