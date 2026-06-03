@@ -41,13 +41,16 @@ export async function validateApiKey(request: Request): Promise<ApiKeyPayload | 
   for (const row of data) {
     const valid = await bcrypt.compare(plainKey, row.key_hash)
     if (valid) {
-      // Best-effort last_used_at bump. Awaited so the row is updated before
-      // the Edge runtime tears down the request context — fire-and-forget
-      // without waitUntil() risks the update being dropped.
-      void supabaseAdmin
+      // last_used_at bump — awaited rather than fire-and-forget. Fire-and-forget
+      // (`void` or even `EdgeRuntime.waitUntil`) proved unreliable on this
+      // runtime; the promise was being dropped on teardown. The ~10ms cost is
+      // worth the guaranteed write because last_used_at drives the dashboard's
+      // "device last seen" column.
+      const { error: updateErr } = await supabaseAdmin
         .from('device_api_keys')
         .update({ last_used_at: new Date().toISOString() })
         .eq('id', row.id)
+      if (updateErr) console.error('[api-auth] last_used_at update error:', updateErr)
 
       return { deviceId, batchingEnabled: Boolean(row.batching_enabled) }
     }
