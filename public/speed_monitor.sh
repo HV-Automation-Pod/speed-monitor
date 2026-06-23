@@ -1021,7 +1021,7 @@ post_result() {
     local http_code
     http_code=$(curl -s -o /dev/null -w "%{http_code}" \
         --max-time 30 --connect-timeout 10 \
-        -L \
+        -L --post302 --post301 \
         -X POST "$APPS_SCRIPT_URL" \
         -H "Content-Type: application/json" \
         -d "$auth_payload" \
