@@ -25,7 +25,7 @@ if [[ -f "$SERVER_URL_FILE" ]]; then
     _cfg_url=$(tr -d '[:space:]' < "$SERVER_URL_FILE" 2>/dev/null)
     [[ "$_cfg_url" =~ ^https?:// ]] && SERVER_URL="$_cfg_url"
 fi
-[[ ! "$SERVER_URL" =~ ^https?:// ]] && SERVER_URL="https://speed-monitor-six.vercel.app"
+[[ ! "$SERVER_URL" =~ ^https?:// ]] && SERVER_URL="https://speed-monitor.riyan-b.workers.dev"
 
 # Edge Functions (Supabase) — used for remote commands (commands-poll / commands-ack)
 EDGE_BASE="https://qsawhnvhfuibnenolkiv.supabase.co/functions/v1"

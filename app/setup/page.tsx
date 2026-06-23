@@ -5,7 +5,7 @@ export const metadata: Metadata = {
   description: 'Install Speed Monitor on your Mac to let IT track your network performance.',
 }
 
-const VERCEL_URL = 'https://speed-monitor-six.vercel.app'
+const VERCEL_URL = 'https://speed-monitor.riyan-b.workers.dev'
 const INSTALL_CMD = `curl -fsSL ${VERCEL_URL}/install.sh | bash`
 
 export default function SetupPage() {
