@@ -9,7 +9,7 @@
 # v2.1.0: Added WiFi debugging metrics (MCS, error rates, BSSID tracking)
 #
 
-APP_VERSION="4.0.0"
+APP_VERSION="4.1.0"
 
 # Configuration
 DATA_DIR="$HOME/.local/share/nkspeedtest"
@@ -26,6 +26,24 @@ if [[ -f "$SERVER_URL_FILE" ]]; then
     [[ "$_cfg_url" =~ ^https?:// ]] && SERVER_URL="$_cfg_url"
 fi
 [[ ! "$SERVER_URL" =~ ^https?:// ]] && SERVER_URL="https://speed-monitor-six.vercel.app"
+
+# Edge Functions (Supabase) — used for remote commands (commands-poll / commands-ack)
+EDGE_BASE="https://qsawhnvhfuibnenolkiv.supabase.co/functions/v1"
+
+# Google Apps Script ingest endpoint + shared token
+# Written to config files by the installer; overridable via env vars.
+APPS_SCRIPT_URL_FILE="$CONFIG_DIR/apps_script_url"
+INGEST_TOKEN_FILE="$CONFIG_DIR/ingest_token"
+APPS_SCRIPT_URL="${SPEED_MONITOR_APPS_SCRIPT_URL:-}"
+INGEST_TOKEN="${SPEED_MONITOR_INGEST_TOKEN:-}"
+if [[ -f "$APPS_SCRIPT_URL_FILE" ]]; then
+    _as_url=$(tr -d '[:space:]' < "$APPS_SCRIPT_URL_FILE" 2>/dev/null)
+    [[ "$_as_url" =~ ^https?:// ]] && APPS_SCRIPT_URL="$_as_url"
+fi
+if [[ -f "$INGEST_TOKEN_FILE" ]]; then
+    _tok=$(tr -d '[:space:]' < "$INGEST_TOKEN_FILE" 2>/dev/null)
+    [[ -n "$_tok" ]] && INGEST_TOKEN="$_tok"
+fi
 
 # API key and provisioning config
 API_KEY_FILE="$CONFIG_DIR/api_key"
@@ -97,8 +115,8 @@ load_credentials() {
     return 0
 }
 
-# GitHub base URL for updates
-GITHUB_BASE="https://raw.githubusercontent.com/hyperkishore/home-internet/main"
+# GitHub base URL for updates (public/ dir is served at root by Next.js)
+GITHUB_BASE="https://raw.githubusercontent.com/HV-Automation-Pod/speed-monitor/main/public"
 
 # Semantic version comparison (returns 0 if v1 >= v2)
 version_gte() {
@@ -162,13 +180,7 @@ update_app() {
         return 1
     fi
 
-    echo "Downloading swiftbar-plugin.sh..."
-    if ! curl -s --max-time 30 "$GITHUB_BASE/swiftbar-plugin.sh" -o "$tmp_dir/swiftbar-plugin.sh"; then
-        echo "Failed to download swiftbar-plugin.sh"
-        return 1
-    fi
-
-    # Download checksum manifest and verify before installing (CLIENT-04)
+    # Download checksum manifest and verify before installing
     echo "Downloading checksums.sha256..."
     if ! curl -s --max-time 10 "$GITHUB_BASE/checksums.sha256" -o "$tmp_dir/checksums.sha256" 2>/dev/null; then
         echo "Failed to download checksums.sha256 — aborting update"
@@ -178,20 +190,15 @@ update_app() {
     if ! (cd "$tmp_dir" && shasum -a 256 -c checksums.sha256 2>/dev/null); then
         echo "CHECKSUM MISMATCH — downloaded script rejected, keeping current version"
         log "CHECKSUM MISMATCH — update aborted"
-        rm -f "$tmp_dir/speed_monitor.sh" "$tmp_dir/swiftbar-plugin.sh" "$tmp_dir/checksums.sha256"
+        rm -f "$tmp_dir/speed_monitor.sh" "$tmp_dir/checksums.sha256"
         return 1
     fi
     echo "Checksum verified — installing update"
     log "Checksum verified — installing update"
 
-    # Validate downloads (shebang check)
+    # Validate download (shebang check)
     if ! head -1 "$tmp_dir/speed_monitor.sh" | grep -q "#!/bin/bash"; then
         echo "Download validation failed for speed_monitor.sh"
-        return 1
-    fi
-
-    if ! head -1 "$tmp_dir/swiftbar-plugin.sh" | grep -q "#!/bin/bash"; then
-        echo "Download validation failed for swiftbar-plugin.sh"
         return 1
     fi
 
@@ -200,20 +207,13 @@ update_app() {
     mkdir -p "$backup_dir"
     echo "Backing up to $backup_dir..."
     cp "$HOME/.local/bin/speed_monitor.sh" "$backup_dir/" 2>/dev/null
-    cp "$HOME/Library/Application Support/SwiftBar/Plugins/nkspeedtest.5m.sh" "$backup_dir/" 2>/dev/null
 
-    # Atomic install - speed_monitor.sh
+    # Atomic install — write to the real pkg-managed path; ~/.local/bin/speed_monitor.sh
+    # is a symlink created by the postinstall pointing here.
+    local _real_bin="/usr/local/speedmonitor/bin/speed_monitor.sh"
     echo "Installing speed_monitor.sh..."
-    mv "$tmp_dir/speed_monitor.sh" "$HOME/.local/bin/speed_monitor.sh"
-    chmod +x "$HOME/.local/bin/speed_monitor.sh"
-
-    # Atomic install - SwiftBar plugin (if SwiftBar is installed)
-    local swiftbar_plugin="$HOME/Library/Application Support/SwiftBar/Plugins/nkspeedtest.5m.sh"
-    if [[ -d "$HOME/Library/Application Support/SwiftBar/Plugins" ]]; then
-        echo "Installing SwiftBar plugin..."
-        mv "$tmp_dir/swiftbar-plugin.sh" "$swiftbar_plugin"
-        chmod +x "$swiftbar_plugin"
-    fi
+    mv "$tmp_dir/speed_monitor.sh" "$_real_bin"
+    chmod +x "$_real_bin"
 
     echo ""
     echo "✓ Updated to version $remote_version"
@@ -779,6 +779,43 @@ track_bssid_changes() {
     echo "ROAM_COUNT=${roam_count:-0}"
 }
 
+# Measure latency (ms) and jitter (ms) by pinging the default gateway.
+# The gateway is local — always reachable, bypasses VPN/Zscaler, measures
+# WiFi link quality rather than internet path.
+# Outputs: LATENCY_MS=X JITTER_MS=X
+measure_latency_ms() {
+    local gateway
+    gateway=$(route get default 2>/dev/null | awk '/gateway:/{print $2; exit}')
+    # Fallback: parse netstat if route failed
+    if [[ -z "$gateway" ]]; then
+        gateway=$(netstat -rn 2>/dev/null | awk '/^default/{print $2; exit}')
+    fi
+
+    if [[ -z "$gateway" ]]; then
+        echo "LATENCY_MS=0"
+        echo "JITTER_MS=0"
+        return
+    fi
+
+    local ping_out
+    ping_out=$(ping -c 6 -q "$gateway" 2>/dev/null | tail -1)
+    if echo "$ping_out" | grep -q "avg"; then
+        # Format: round-trip min/avg/max/stddev = 1.234/5.678/9.012/1.111 ms
+        local avg stddev
+        avg=$(echo "$ping_out" | awk -F'[=/]' '{print $(NF-2)}')
+        stddev=$(echo "$ping_out" | awk -F'[=/]' '{printf "%.2f", $(NF-1)}')
+        # Sanity cap: if somehow > 2000ms the measurement is bogus
+        if (( $(echo "$avg > 2000" | bc -l 2>/dev/null || echo 0) )); then
+            avg=0; stddev=0
+        fi
+        echo "LATENCY_MS=$(printf "%.1f" "$avg")"
+        echo "JITTER_MS=$stddev"
+    else
+        echo "LATENCY_MS=0"
+        echo "JITTER_MS=0"
+    fi
+}
+
 # Run ping test for jitter and packet loss calculation
 run_ping_test() {
     local target="${1:-8.8.8.8}"
@@ -968,23 +1005,62 @@ build_json_payload() {
     echo "$json"
 }
 
-# Post speed test result to Vercel (CLIENT-09 v2 — fallback removed, old server is offline).
+# Post speed test result to the Google Apps Script ingest endpoint.
 post_result() {
     local payload="$1"
+
+    if [[ -z "$APPS_SCRIPT_URL" ]]; then
+        log "post_result: APPS_SCRIPT_URL not configured — skipping"
+        return 1
+    fi
+
+    # Inject ingest_token into the payload before sending
+    local auth_payload
+    auth_payload=$(echo "$payload" | sed "s/^{/{\"ingest_token\":\"$INGEST_TOKEN\",/")
+
     local http_code
     http_code=$(curl -s -o /dev/null -w "%{http_code}" \
         --max-time 30 --connect-timeout 10 \
-        -X POST "$SERVER_URL/api/ingest/result" \
+        -L \
+        -X POST "$APPS_SCRIPT_URL" \
         -H "Content-Type: application/json" \
-        -H "X-Api-Key: $DEVICE_ID:$API_KEY" \
-        -d "$payload" \
+        -d "$auth_payload" \
         2>/dev/null)
     if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]]; then
-        log "POST to Vercel succeeded (HTTP $http_code)"
+        log "POST to Apps Script succeeded (HTTP $http_code)"
         return 0
     fi
-    log "ERROR: POST to Vercel failed (HTTP $http_code)"
+    log "ERROR: POST to Apps Script failed (HTTP $http_code)"
     return 1
+}
+
+# ============================================================================
+# EDGE COMMANDS — v4.1.0
+# Polls Supabase Edge for remote commands (force_update, restart_service, etc.)
+# Ingest now goes via Google Apps Script, not Edge Functions.
+# ============================================================================
+
+EDGE_POLL_RESPONSE=""
+poll_edge_commands() {
+    EDGE_POLL_RESPONSE=""
+
+    if [[ -z "$API_KEY" ]]; then
+        log "poll_edge_commands: no API key — skipping"
+        return 1
+    fi
+
+    local response
+    response=$(curl -s --max-time 10 --connect-timeout 5 \
+        -H "X-Api-Key: $DEVICE_ID:$API_KEY" \
+        "$EDGE_BASE/commands-poll" 2>/dev/null)
+
+    if [[ -z "$response" ]]; then
+        log "poll_edge_commands: no response"
+        return 1
+    fi
+
+    EDGE_POLL_RESPONSE="$response"
+    return 0
 }
 
 # Main collection function
@@ -1132,12 +1208,24 @@ collect_metrics() {
             local speedtest_output=$(cat "$tmp_output")
 
             if [[ $speedtest_exit -eq 0 ]] && echo "$speedtest_output" | grep -q "Download:"; then
-                LATENCY_MS=$(echo "$speedtest_output" | grep "Ping:" | awk '{print $2}')
                 DOWNLOAD_MBPS=$(echo "$speedtest_output" | grep "Download:" | awk '{print $2}')
-                UPLOAD_MBPS=$(echo "$speedtest_output" | grep "Upload:" | awk '{print $2}')
+                UPLOAD_MBPS=$(echo "$speedtest_output"  | grep "Upload:"   | awk '{print $2}')
+                # Use speedtest-cli's own Ping (it pings the nearest server).
+                # Sanity-cap at 2000ms — if Zscaler spoofs the value, fall back to gateway ping.
+                local _cli_ping
+                _cli_ping=$(echo "$speedtest_output" | grep "Ping:" | awk '{print $2}')
+                if is_positive_number "${_cli_ping:-}" && \
+                   awk "BEGIN{exit !($_cli_ping < 2000)}" 2>/dev/null; then
+                    LATENCY_MS="$_cli_ping"
+                    JITTER_MS="0"
+                else
+                    while IFS='=' read -r _lk _lv; do
+                        [[ "$_lk" =~ ^[A-Z_]+$ ]] && printf -v "$_lk" '%s' "$_lv"
+                    done < <(measure_latency_ms)
+                fi
                 STATUS="success"
                 speedtest_success=true
-                log "Strategy 1 succeeded - Down: ${DOWNLOAD_MBPS} Mbps, Up: ${UPLOAD_MBPS} Mbps"
+                log "Strategy 1 succeeded - Down: ${DOWNLOAD_MBPS} Mbps, Up: ${UPLOAD_MBPS} Mbps, Lat: ${LATENCY_MS}ms"
             else
                 log "Strategy 1 failed: exit=$speedtest_exit, output=$(head -1 "$tmp_output")"
             fi
@@ -1168,12 +1256,22 @@ collect_metrics() {
             local speedtest_output=$(cat "$tmp_output")
 
             if [[ $speedtest_exit -eq 0 ]] && echo "$speedtest_output" | grep -q "Download:"; then
-                LATENCY_MS=$(echo "$speedtest_output" | grep "Ping:" | awk '{print $2}')
                 DOWNLOAD_MBPS=$(echo "$speedtest_output" | grep "Download:" | awk '{print $2}')
-                UPLOAD_MBPS=$(echo "$speedtest_output" | grep "Upload:" | awk '{print $2}')
+                UPLOAD_MBPS=$(echo "$speedtest_output"  | grep "Upload:"   | awk '{print $2}')
+                local _cli_ping2
+                _cli_ping2=$(echo "$speedtest_output" | grep "Ping:" | awk '{print $2}')
+                if is_positive_number "${_cli_ping2:-}" && \
+                   awk "BEGIN{exit !($_cli_ping2 < 2000)}" 2>/dev/null; then
+                    LATENCY_MS="$_cli_ping2"
+                    JITTER_MS="0"
+                else
+                    while IFS='=' read -r _lk _lv; do
+                        [[ "$_lk" =~ ^[A-Z_]+$ ]] && printf -v "$_lk" '%s' "$_lv"
+                    done < <(measure_latency_ms)
+                fi
                 STATUS="success"
                 speedtest_success=true
-                log "Strategy 2 succeeded - Down: ${DOWNLOAD_MBPS} Mbps, Up: ${UPLOAD_MBPS} Mbps"
+                log "Strategy 2 succeeded - Down: ${DOWNLOAD_MBPS} Mbps, Up: ${UPLOAD_MBPS} Mbps, Lat: ${LATENCY_MS}ms"
             else
                 log "Strategy 2 failed: exit=$speedtest_exit, output=$(head -1 "$tmp_output")"
             fi
@@ -1181,64 +1279,92 @@ collect_metrics() {
         rm -f "$tmp_output"
     fi
 
-    # Strategy 3: Cloudflare speed test (simple HTTPS download - works through most proxies)
+    # Strategy 3: Ookla-like methodology against Cloudflare
+    #   - ICMP ping to speed.cloudflare.com (same server, real internet RTT)
+    #   - 4 parallel streams × 15s per direction (mirrors Ookla window)
+    #   - 400MB payload per stream — large enough that --max-time 15 always cuts first
+    #     (handles any realistic link speed without needing a probe phase)
     if [[ "$speedtest_success" == "false" ]]; then
-        log "Strategy 3: Cloudflare download test"
-        # Download 25MB from Cloudflare and measure speed
-        local cf_result=$(curl -s -o /dev/null -w "%{speed_download},%{time_total},%{http_code}" \
-            --connect-timeout 10 --max-time 30 \
-            "https://speed.cloudflare.com/__down?bytes=25000000" 2>&1)
+        local _cf_host="speed.cloudflare.com"
 
-        local cf_speed=$(echo "$cf_result" | cut -d',' -f1)
-        local cf_time=$(echo "$cf_result" | cut -d',' -f2)
-        local cf_code=$(echo "$cf_result" | cut -d',' -f3)
+        # Step 1: Latency — ICMP ping to test server (bypasses curl/proxy issues)
+        log "Strategy 3: pinging ${_cf_host} for latency..."
+        local _raw_ping
+        _raw_ping=$(ping -c 8 -q "$_cf_host" 2>/dev/null | tail -1)
+        if echo "$_raw_ping" | grep -q "avg"; then
+            LATENCY_MS=$(echo "$_raw_ping" | awk -F'[=/]' '{printf "%.1f", $(NF-3)}')
+            JITTER_MS=$(echo "$_raw_ping"  | awk -F'[=/]' '{printf "%.2f", $(NF-1)}')
+        else
+            # ICMP blocked — fall back to gateway ping
+            while IFS='=' read -r _lk _lv; do
+                [[ "$_lk" =~ ^[A-Z_]+$ ]] && printf -v "$_lk" '%s' "$_lv"
+            done < <(measure_latency_ms)
+        fi
+        JITTER_P50=${JITTER_MS}; JITTER_P95=${JITTER_MS}
+        log "Latency: ${LATENCY_MS}ms  Jitter: ${JITTER_MS}ms"
 
-        if [[ "$cf_code" == "200" ]] && [[ -n "$cf_speed" ]] && [[ "$cf_speed" != "0" ]]; then
-            # Convert bytes/sec to Mbps (bytes/sec * 8 / 1000000)
-            DOWNLOAD_MBPS=$(echo "scale=2; $cf_speed * 8 / 1000000" | bc 2>/dev/null || echo "0")
+        # Step 2: Download — 2 parallel streams × 20 MB, 8s window
+        # 2 streams keeps fleet bandwidth sane (350 devices × 10 min).
+        # 20 MB is enough to measure 10–200 Mbps accurately within 8 seconds.
+        log "Strategy 3: 2-stream download..."
+        local _cf_tmp; _cf_tmp=$(mktemp -d)
+        for _i in 1 2; do
+            curl -s -o /dev/null -w "%{speed_download}\n" \
+                --connect-timeout 10 --max-time 8 \
+                "https://${_cf_host}/__down?bytes=20000000" \
+                > "${_cf_tmp}/dl_${_i}" 2>/dev/null &
+        done
+        wait
 
-            # Measure REAL latency and jitter using ping to Cloudflare DNS (1.1.1.1)
-            local ping_results=$(ping -c 5 -q 1.1.1.1 2>/dev/null | tail -1)
-            if [[ -n "$ping_results" ]] && echo "$ping_results" | grep -q "avg"; then
-                # Format: round-trip min/avg/max/stddev = 10.123/15.456/20.789/3.456 ms
-                local ping_stats=$(echo "$ping_results" | awk -F'=' '{print $2}' | awk -F'/' '{print $2, $4}')
-                LATENCY_MS=$(echo "$ping_stats" | awk '{printf "%.1f", $1}')
-                JITTER_MS=$(echo "$ping_stats" | awk '{printf "%.2f", $2}')
-                JITTER_P50=${JITTER_MS}
-                JITTER_P95=${JITTER_MS}
-                log "Measured latency: ${LATENCY_MS}ms, jitter: ${JITTER_MS}ms"
-            else
-                # Fallback: use curl connection time as rough latency estimate
-                local curl_latency=$(curl -s -o /dev/null -w "%{time_connect}" --connect-timeout 5 "https://1.1.1.1" 2>/dev/null)
-                LATENCY_MS=$(echo "scale=1; ${curl_latency:-0} * 1000" | bc 2>/dev/null || echo "0")
-                JITTER_MS="0"
-                log "Fallback latency measurement: ${LATENCY_MS}ms"
+        local _total_dl_bps=0 _dl_ok=false
+        for _i in 1 2; do
+            local _s; _s=$(tr -d ' \n' < "${_cf_tmp}/dl_${_i}" 2>/dev/null)
+            if is_positive_number "$_s" && [[ "$_s" != "0" ]]; then
+                _total_dl_bps=$(echo "scale=4; ${_total_dl_bps} + ${_s}" | bc 2>/dev/null || echo "$_total_dl_bps")
+                _dl_ok=true
             fi
+        done
+        rm -rf "$_cf_tmp"
 
-            # Measure upload speed using Cloudflare upload endpoint
-            log "Measuring upload speed..."
-            local upload_data=$(dd if=/dev/zero bs=1M count=5 2>/dev/null | base64)
-            local cf_upload_result=$(curl -s -o /dev/null -w "%{speed_upload},%{http_code}" \
-                --connect-timeout 10 --max-time 30 \
-                -X POST -d "$upload_data" \
-                "https://speed.cloudflare.com/__up" 2>&1)
+        if [[ "$_dl_ok" == "true" ]]; then
+            DOWNLOAD_MBPS=$(echo "scale=2; $_total_dl_bps * 8 / 1000000" | bc 2>/dev/null || echo "0")
+            log "Download: ${DOWNLOAD_MBPS} Mbps"
 
-            local cf_upload_speed=$(echo "$cf_upload_result" | cut -d',' -f1)
-            local cf_upload_code=$(echo "$cf_upload_result" | cut -d',' -f2)
+            # Step 3: Upload — 2 parallel streams × 15 MB, 8s window
+            log "Strategy 3: 2-stream upload..."
+            local _ul_tmp; _ul_tmp=$(mktemp -d)
+            for _i in 1 2; do
+                dd if=/dev/zero bs=1048576 count=15 2>/dev/null | \
+                curl -s -o /dev/null -w "%{speed_upload}\n" \
+                    --connect-timeout 10 --max-time 8 \
+                    -X POST --data-binary @- \
+                    "https://${_cf_host}/__up" \
+                    > "${_ul_tmp}/ul_${_i}" 2>/dev/null &
+            done
+            wait
 
-            if [[ "$cf_upload_code" == "200" ]] && [[ -n "$cf_upload_speed" ]] && [[ "$cf_upload_speed" != "0" ]]; then
-                UPLOAD_MBPS=$(echo "scale=2; $cf_upload_speed * 8 / 1000000" | bc 2>/dev/null || echo "0")
-                log "Upload speed: ${UPLOAD_MBPS} Mbps"
+            local _total_ul_bps=0
+            for _i in 1 2; do
+                local _us; _us=$(tr -d ' \n' < "${_ul_tmp}/ul_${_i}" 2>/dev/null)
+                if is_positive_number "$_us" && [[ "$_us" != "0" ]]; then
+                    _total_ul_bps=$(echo "scale=4; ${_total_ul_bps} + ${_us}" | bc 2>/dev/null || echo "$_total_ul_bps")
+                fi
+            done
+            rm -rf "$_ul_tmp"
+
+            if is_positive_number "$_total_ul_bps" && [[ "$_total_ul_bps" != "0" ]]; then
+                UPLOAD_MBPS=$(echo "scale=2; $_total_ul_bps * 8 / 1000000" | bc 2>/dev/null || echo "0")
+                log "Upload: ${UPLOAD_MBPS} Mbps"
             else
                 UPLOAD_MBPS="0"
-                log "Upload measurement failed, setting to 0"
+                log "Upload measurement failed"
             fi
 
             STATUS="success_cloudflare"
             speedtest_success=true
             log "Strategy 3 succeeded (Cloudflare) - Down: ${DOWNLOAD_MBPS} Mbps, Up: ${UPLOAD_MBPS} Mbps, Latency: ${LATENCY_MS}ms"
         else
-            log "Strategy 3 failed: code=$cf_code speed=$cf_speed"
+            log "Strategy 3 failed: parallel streams returned no data"
         fi
     fi
 
@@ -1259,22 +1385,14 @@ collect_metrics() {
             if [[ "$fast_code" == "200" ]] && [[ -n "$fast_speed" ]] && [[ "$fast_speed" != "0" ]]; then
                 DOWNLOAD_MBPS=$(echo "scale=2; $fast_speed * 8 / 1000000" | bc 2>/dev/null || echo "0")
 
-                # Measure REAL latency and jitter using ping to Google DNS (8.8.8.8)
-                local ping_results=$(ping -c 5 -q 8.8.8.8 2>/dev/null | tail -1)
-                if [[ -n "$ping_results" ]] && echo "$ping_results" | grep -q "avg"; then
-                    local ping_stats=$(echo "$ping_results" | awk -F'=' '{print $2}' | awk -F'/' '{print $2, $4}')
-                    LATENCY_MS=$(echo "$ping_stats" | awk '{printf "%.1f", $1}')
-                    JITTER_MS=$(echo "$ping_stats" | awk '{printf "%.2f", $2}')
-                    JITTER_P50=${JITTER_MS}
-                    JITTER_P95=${JITTER_MS}
-                    log "Measured latency: ${LATENCY_MS}ms, jitter: ${JITTER_MS}ms"
-                else
-                    # Fallback: use curl connection time
-                    local curl_latency=$(curl -s -o /dev/null -w "%{time_connect}" --connect-timeout 5 "https://8.8.8.8" 2>/dev/null)
-                    LATENCY_MS=$(echo "scale=1; ${curl_latency:-0} * 1000" | bc 2>/dev/null || echo "0")
-                    JITTER_MS="0"
-                    log "Fallback latency measurement: ${LATENCY_MS}ms"
-                fi
+                # Measure latency via default gateway (local, bypasses VPN)
+                while IFS='=' read -r _lkey _lval; do
+                    [[ "$_lkey" =~ ^[A-Z_]+$ ]] || continue
+                    printf -v "$_lkey" '%s' "$_lval"
+                done < <(measure_latency_ms)
+                JITTER_P50=${JITTER_MS}
+                JITTER_P95=${JITTER_MS}
+                log "Measured latency: ${LATENCY_MS}ms, jitter: ${JITTER_MS}ms (gateway ping)"
 
                 UPLOAD_MBPS="0"
                 STATUS="success_fastcom"
@@ -1353,15 +1471,12 @@ collect_metrics() {
     # Append to CSV (v2.1 schema)
     echo "$TIMESTAMP_UTC,$DEVICE_ID,$OS_VERSION,$APP_VERSION,$TIMEZONE,$INTERFACE,$_csv_ssid,$BSSID,$BAND,$CHANNEL,$WIDTH_MHZ,$RSSI_DBM,$NOISE_DBM,$SNR_DB,$TX_RATE_MBPS,$MCS_INDEX,$SPATIAL_STREAMS,$LOCAL_IP,$PUBLIC_IP,$LATENCY_MS,$JITTER_MS,$JITTER_P50,$JITTER_P95,$PACKET_LOSS_PCT,$DOWNLOAD_MBPS,$UPLOAD_MBPS,$VPN_STATUS,$VPN_NAME,$INPUT_ERRORS,$OUTPUT_ERRORS,$INPUT_ERROR_RATE,$OUTPUT_ERROR_RATE,$TCP_RETRANSMITS,$BSSID_CHANGED,$ROAM_COUNT,$_csv_errors,\"$csv_payload\"" >> "$CSV_FILE"
 
-    # Send to server if configured
-    if [[ -n "$SERVER_URL" ]]; then
-        if [[ -z "$API_KEY" ]]; then
-            log "ERROR: API key not loaded — skipping POST"
-        else
-            log "Sending results to server..."
-            post_result "$raw_payload" || log "Failed to send to Vercel"
-        fi
-    fi
+    # Post result to Apps Script ingest endpoint
+    log "Sending result to Apps Script..."
+    post_result "$raw_payload" || log "WARNING: Apps Script ingest failed — result saved to CSV"
+
+    # Poll Edge for remote commands (non-blocking — failure is silent)
+    poll_edge_commands && process_edge_commands "$EDGE_POLL_RESPONSE"
 
     # Print summary
     echo "=== Speed Test Results (v$APP_VERSION) ==="
@@ -1393,49 +1508,57 @@ collect_metrics() {
     mv "$_tmp_result" "$_result_file"
 
     log "Test completed"
-
-    # Check for and execute remote commands
-    check_remote_commands
 }
 
 # ============================================================================
-# REMOTE COMMANDS - Check for and execute commands from server
+# REMOTE COMMANDS - Edge-based (v4.1.0) + legacy Vercel fallback
 # ============================================================================
 
-check_remote_commands() {
-    log "Checking for remote commands..."
+# Ack a single command via Edge commands-ack.
+ack_edge_command() {
+    local cmd_id="$1"
+    local status="$2"
+    local result="$3"
 
-    # Fetch pending commands from server
-    if [[ -z "$API_KEY" ]]; then
-        log "ERROR: API key not loaded — skipping remote command check"
-        return
-    fi
-    local response=$(curl -s --max-time 10 \
+    local safe_result
+    safe_result=$(echo "$result" | head -c 500 | sed 's/"/\\"/g' | tr '\n' ' ')
+
+    curl -s -o /dev/null --max-time 10 \
+        -X POST "$EDGE_BASE/commands-ack" \
+        -H "Content-Type: application/json" \
         -H "X-Api-Key: $DEVICE_ID:$API_KEY" \
-        "$SERVER_URL/api/commands/$DEVICE_ID" 2>/dev/null)
+        -d "{\"command_id\":$cmd_id,\"status\":\"$status\",\"result\":\"$safe_result\"}" \
+        2>/dev/null
+}
+
+# Process commands from an Edge commands-poll response JSON string.
+# Handles flush_now (triggers buffer flush) plus the existing command types.
+# Acks each command via Edge commands-ack.
+process_edge_commands() {
+    local response="$1"
 
     if [[ -z "$response" ]]; then
-        log "No response from command server"
         return
     fi
 
-    # Parse commands array (simple JSON parsing)
-    local commands=$(echo "$response" | grep -o '"command":"[^"]*"' | cut -d'"' -f4)
-    local ids=$(echo "$response" | grep -o '"id":[0-9]*' | cut -d':' -f2)
+    local commands
+    commands=$(echo "$response" | grep -o '"command":"[^"]*"' | cut -d'"' -f4)
+    local ids
+    ids=$(echo "$response" | grep -o '"id":[0-9]*' | cut -d':' -f2)
 
     if [[ -z "$commands" ]]; then
-        log "No pending commands"
+        log "No pending Edge commands"
         return
     fi
 
-    # Process each command
     local i=1
     echo "$commands" | while read -r cmd; do
-        local cmd_id=$(echo "$ids" | sed -n "${i}p")
-        log "Executing command: $cmd (id: $cmd_id)"
+        local cmd_id
+        cmd_id=$(echo "$ids" | sed -n "${i}p")
+        log "Executing Edge command: $cmd (id: $cmd_id)"
 
         local result=""
-        local status="executed"
+        local status="completed"
 
         case "$cmd" in
             force_update)
@@ -1443,7 +1566,6 @@ check_remote_commands() {
                 result=$("$0" --update 2>&1) || status="failed"
                 ;;
             force_speedtest)
-                log "Force speedtest will run on next cycle (already running)"
                 result="Speedtest already completed in this cycle"
                 ;;
             restart_service)
@@ -1454,7 +1576,6 @@ check_remote_commands() {
                 result="Service restarted"
                 ;;
             collect_diagnostics)
-                log "Collecting diagnostics..."
                 result=$(collect_diagnostics_data 2>&1) || status="failed"
                 ;;
             *)
@@ -1464,18 +1585,11 @@ check_remote_commands() {
                 ;;
         esac
 
-        # Report result back to server
-        if [[ -n "$cmd_id" ]]; then
-            curl -s --max-time 10 -X POST "$SERVER_URL/api/commands/$cmd_id/result" \
-                -H "Content-Type: application/json" \
-                -H "X-Api-Key: $DEVICE_ID:$API_KEY" \
-                -d "{\"status\":\"$status\",\"result\":\"$(echo "$result" | head -c 500 | sed 's/"/\\"/g' | tr '\n' ' ')\"}" \
-                >/dev/null 2>&1
-        fi
-
+        [[ -n "$cmd_id" ]] && ack_edge_command "$cmd_id" "$status" "$result"
         i=$((i + 1))
     done
 }
+
 
 # Collect diagnostics data for remote diagnostics command
 collect_diagnostics_data() {
