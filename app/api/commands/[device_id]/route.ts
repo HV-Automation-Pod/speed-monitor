@@ -1,3 +1,5 @@
+export const runtime = 'edge'
+
 import { NextResponse } from 'next/server'
 import { validateApiKey } from '@/lib/supabase/api-auth'
 import { supabaseAdmin } from '@/lib/supabase/admin'

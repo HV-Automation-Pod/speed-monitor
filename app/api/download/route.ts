@@ -1,3 +1,5 @@
+export const runtime = 'edge'
+
 import { NextResponse } from 'next/server'
 
 // Redirect to the v4.0.0 pkg served as a static asset from public/.

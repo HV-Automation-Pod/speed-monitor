@@ -1,3 +1,5 @@
+export const runtime = 'edge'
+
 import { NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/supabase/admin'
 import bcrypt from 'bcryptjs'
@@ -15,7 +17,7 @@ export async function POST(request: Request) {
   }
 
   // Generate cryptographically secure 32-byte API key (64 hex chars, 256 bits entropy)
-  const apiKey = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('hex')
+  const apiKey = Array.from(crypto.getRandomValues(new Uint8Array(32))).map(b => b.toString(16).padStart(2, '0')).join('')
   const keyHash = await bcrypt.hash(apiKey, SALT_ROUNDS)
 
   if (body.device_id) {
