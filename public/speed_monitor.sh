@@ -97,8 +97,9 @@ provision_device() {
     return 0
 }
 
-# Load API key and device ID from config files.
-# Auto-provisions if missing. Returns 1 if credentials unavailable.
+# Load API key and device ID from config files. Best-effort: never blocks
+# ingest. The api_key is only needed for edge commands (poll_edge_commands);
+# ingest goes via Apps Script and needs only a device_id. Always returns 0.
 load_credentials() {
     API_KEY=""
     DEVICE_ID=""
@@ -106,10 +107,19 @@ load_credentials() {
     [[ -f "$API_KEY_FILE" ]] && API_KEY=$(tr -d '[:space:]' < "$API_KEY_FILE" 2>/dev/null)
     [[ -f "$DEVICE_ID_FILE" ]] && DEVICE_ID=$(tr -d '[:space:]' < "$DEVICE_ID_FILE" 2>/dev/null)
 
+    # Try provisioning to obtain an api_key (for edge commands) — best-effort only.
     if [[ -z "$API_KEY" || -z "$DEVICE_ID" ]]; then
-        provision_device || return 1
-        API_KEY=$(tr -d '[:space:]' < "$API_KEY_FILE" 2>/dev/null)
-        DEVICE_ID=$(tr -d '[:space:]' < "$DEVICE_ID_FILE" 2>/dev/null)
+        provision_device || true
+        [[ -f "$API_KEY_FILE" ]]   && API_KEY=$(tr -d '[:space:]' < "$API_KEY_FILE" 2>/dev/null)
+        [[ -f "$DEVICE_ID_FILE" ]] && DEVICE_ID=$(tr -d '[:space:]' < "$DEVICE_ID_FILE" 2>/dev/null)
+    fi
+
+    # Ingest needs a device_id even if provisioning failed — generate one locally.
+    if [[ -z "$DEVICE_ID" ]]; then
+        DEVICE_ID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+        install -m 600 /dev/null "$DEVICE_ID_FILE" 2>/dev/null || true
+        printf '%s' "$DEVICE_ID" > "$DEVICE_ID_FILE"
+        log "Provisioning unavailable — generated local device_id: $DEVICE_ID"
     fi
 
     return 0
@@ -803,7 +813,7 @@ measure_latency_ms() {
         # Format: round-trip min/avg/max/stddev = 1.234/5.678/9.012/1.111 ms
         local avg stddev
         avg=$(echo "$ping_out" | awk -F'[=/]' '{print $(NF-2)}')
-        stddev=$(echo "$ping_out" | awk -F'[=/]' '{printf "%.2f", $(NF-1)}')
+        stddev=$(echo "$ping_out" | awk -F'[=/]' '{printf "%.2f", $(NF)}')   # stddev = NF, not max (NF-1)
         # Sanity cap: if somehow > 2000ms the measurement is bogus
         if (( $(echo "$avg > 2000" | bc -l 2>/dev/null || echo 0) )); then
             avg=0; stddev=0
@@ -1018,15 +1028,19 @@ post_result() {
     local auth_payload
     auth_payload=$(echo "$payload" | sed "s/^{/{\"ingest_token\":\"$INGEST_TOKEN\",/")
 
+    # Apps Script runs doPost when the POST hits /exec, then returns a 302 to the
+    # result URL (script.googleusercontent.com/macros/echo). doPost has already
+    # executed (sheet write + Supabase forward) by then, so a 302 IS success.
+    # Do NOT follow the redirect with --post302 — that re-POSTs to the GET-only
+    # echo URL and yields a bogus "Page Not Found". Don't follow at all; accept 3xx.
     local http_code
     http_code=$(curl -s -o /dev/null -w "%{http_code}" \
         --max-time 30 --connect-timeout 10 \
-        -L --post302 --post301 \
         -X POST "$APPS_SCRIPT_URL" \
         -H "Content-Type: application/json" \
         -d "$auth_payload" \
         2>/dev/null)
-    if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]]; then
+    if [[ "$http_code" -ge 200 && "$http_code" -lt 400 ]]; then
         log "POST to Apps Script succeeded (HTTP $http_code)"
         return 0
     fi
@@ -1095,6 +1109,13 @@ collect_metrics() {
         SNR_DB="${SNR_DB:-0}"
         TX_RATE_MBPS="${TX_RATE_MBPS:-0}"
     fi
+
+    # Safety net: every unquoted-numeric JSON field MUST be a number. An empty
+    # value (e.g. WiFi width/snr that failed to parse on a connected device)
+    # would emit `"width_mhz":,` → invalid JSON → the whole POST fails.
+    CHANNEL="${CHANNEL:-0}";     WIDTH_MHZ="${WIDTH_MHZ:-0}";   RSSI_DBM="${RSSI_DBM:-0}"
+    NOISE_DBM="${NOISE_DBM:-0}"; SNR_DB="${SNR_DB:-0}";         TX_RATE_MBPS="${TX_RATE_MBPS:-0}"
+    MCS_INDEX="${MCS_INDEX:-0}"; SPATIAL_STREAMS="${SPATIAL_STREAMS:-0}"
 
     # Network info
     LOCAL_IP=$(get_local_ip)
@@ -1209,8 +1230,10 @@ collect_metrics() {
         local _raw_ping
         _raw_ping=$(ping -c 8 -q "$_cf_host" 2>/dev/null | tail -1)
         if echo "$_raw_ping" | grep -q "avg"; then
-            LATENCY_MS=$(echo "$_raw_ping" | awk -F'[=/]' '{printf "%.1f", $(NF-3)}')
-            JITTER_MS=$(echo "$_raw_ping"  | awk -F'[=/]' '{printf "%.2f", $(NF-1)}')
+            # macOS: round-trip min/avg/max/stddev = a/b/c/d ms  (NF=8 on [=/] split)
+            # latency = avg (NF-2), jitter = stddev (NF) — NOT min (NF-3) / max (NF-1)
+            LATENCY_MS=$(echo "$_raw_ping" | awk -F'[=/]' '{printf "%.1f", $(NF-2)}')
+            JITTER_MS=$(echo "$_raw_ping"  | awk -F'[=/]' '{printf "%.2f", $(NF)}')
         else
             # ICMP blocked — fall back to gateway ping
             while IFS='=' read -r _lk _lv; do
@@ -1610,11 +1633,10 @@ collect_diagnostics_data() {
     tail -20 "$SCRIPT_DIR/launchd_stderr.log" 2>/dev/null || echo "No error log found"
 }
 
-# Load API credentials (auto-provisions on first run)
-if ! load_credentials; then
-    log "Credentials unavailable — skipping speed test run"
-    exit 0
-fi
+# Load credentials (best-effort; always succeeds with at least a local device_id).
+# Ingest is NOT gated on provisioning — a device with no api_key still reports
+# data via Apps Script; only edge commands are skipped when the key is absent.
+load_credentials
 
 # Run main collection
 collect_metrics
