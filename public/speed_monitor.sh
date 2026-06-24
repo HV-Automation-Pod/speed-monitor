@@ -9,7 +9,7 @@
 # v2.1.0: Added WiFi debugging metrics (MCS, error rates, BSSID tracking)
 #
 
-APP_VERSION="4.1.0"
+APP_VERSION="4.2.0"
 
 # Configuration
 DATA_DIR="$HOME/.local/share/nkspeedtest"
@@ -1185,9 +1185,96 @@ collect_metrics() {
 
     local speedtest_success=false
 
-    # Strategy 1: speedtest-cli with --secure flag (HTTPS, may work better with proxy)
+    # Strategy 1 (PRIMARY): Cloudflare — 2 parallel TCP streams, AVERAGED
+    # Two independent streams per direction; the per-stream speeds are averaged
+    # (not summed) to report a representative throughput. Primary because the
+    # single-connection speedtest-cli under-reports through corporate proxies.
     if [[ "$speedtest_success" == "false" ]]; then
-        log "Strategy 1: speedtest-cli --secure"
+        local _cf_host="speed.cloudflare.com"
+
+        # Latency — ICMP ping to the test server (bypasses curl/proxy issues)
+        log "Strategy 1: pinging ${_cf_host} for latency..."
+        local _raw_ping
+        _raw_ping=$(ping -c 8 -q "$_cf_host" 2>/dev/null | tail -1)
+        if echo "$_raw_ping" | grep -q "avg"; then
+            LATENCY_MS=$(echo "$_raw_ping" | awk -F'[=/]' '{printf "%.1f", $(NF-3)}')
+            JITTER_MS=$(echo "$_raw_ping"  | awk -F'[=/]' '{printf "%.2f", $(NF-1)}')
+        else
+            # ICMP blocked — fall back to gateway ping
+            while IFS='=' read -r _lk _lv; do
+                [[ "$_lk" =~ ^[A-Z_]+$ ]] && printf -v "$_lk" '%s' "$_lv"
+            done < <(measure_latency_ms)
+        fi
+        JITTER_P50=${JITTER_MS}; JITTER_P95=${JITTER_MS}
+        log "Latency: ${LATENCY_MS}ms  Jitter: ${JITTER_MS}ms"
+
+        # Download — 2 parallel streams × 20 MB, 8s window, AVERAGED
+        log "Strategy 1: 2-stream download (averaged)..."
+        local _cf_tmp; _cf_tmp=$(mktemp -d)
+        for _i in 1 2; do
+            curl -s -o /dev/null -w "%{speed_download}\n" \
+                --connect-timeout 10 --max-time 8 \
+                "https://${_cf_host}/__down?bytes=20000000" \
+                > "${_cf_tmp}/dl_${_i}" 2>/dev/null &
+        done
+        wait
+
+        local _dl_sum=0 _dl_n=0
+        for _i in 1 2; do
+            local _s; _s=$(tr -d ' \n' < "${_cf_tmp}/dl_${_i}" 2>/dev/null)
+            if is_positive_number "$_s" && [[ "$_s" != "0" ]]; then
+                _dl_sum=$(echo "scale=4; ${_dl_sum} + ${_s}" | bc 2>/dev/null || echo "$_dl_sum")
+                _dl_n=$((_dl_n + 1))
+            fi
+        done
+        rm -rf "$_cf_tmp"
+
+        if [[ "$_dl_n" -gt 0 ]]; then
+            DOWNLOAD_MBPS=$(echo "scale=2; $_dl_sum * 8 / 1000000 / $_dl_n" | bc 2>/dev/null || echo "0")
+            log "Download: ${DOWNLOAD_MBPS} Mbps (avg of $_dl_n streams)"
+
+            # Upload — 2 parallel streams × 15 MB, 8s window, AVERAGED
+            log "Strategy 1: 2-stream upload (averaged)..."
+            local _ul_tmp; _ul_tmp=$(mktemp -d)
+            for _i in 1 2; do
+                dd if=/dev/zero bs=1048576 count=15 2>/dev/null | \
+                curl -s -o /dev/null -w "%{speed_upload}\n" \
+                    --connect-timeout 10 --max-time 8 \
+                    -X POST --data-binary @- \
+                    "https://${_cf_host}/__up" \
+                    > "${_ul_tmp}/ul_${_i}" 2>/dev/null &
+            done
+            wait
+
+            local _ul_sum=0 _ul_n=0
+            for _i in 1 2; do
+                local _us; _us=$(tr -d ' \n' < "${_ul_tmp}/ul_${_i}" 2>/dev/null)
+                if is_positive_number "$_us" && [[ "$_us" != "0" ]]; then
+                    _ul_sum=$(echo "scale=4; ${_ul_sum} + ${_us}" | bc 2>/dev/null || echo "$_ul_sum")
+                    _ul_n=$((_ul_n + 1))
+                fi
+            done
+            rm -rf "$_ul_tmp"
+
+            if [[ "$_ul_n" -gt 0 ]]; then
+                UPLOAD_MBPS=$(echo "scale=2; $_ul_sum * 8 / 1000000 / $_ul_n" | bc 2>/dev/null || echo "0")
+                log "Upload: ${UPLOAD_MBPS} Mbps (avg of $_ul_n streams)"
+            else
+                UPLOAD_MBPS="0"
+                log "Upload measurement failed"
+            fi
+
+            STATUS="success_cloudflare"
+            speedtest_success=true
+            log "Strategy 1 succeeded (Cloudflare 2-stream avg) - Down: ${DOWNLOAD_MBPS} Mbps, Up: ${UPLOAD_MBPS} Mbps, Latency: ${LATENCY_MS}ms"
+        else
+            log "Strategy 1 failed: parallel streams returned no data"
+        fi
+    fi
+
+    # Fallback A: speedtest-cli with --secure flag (HTTPS, may work better with proxy)
+    if [[ "$speedtest_success" == "false" ]]; then
+        log "Fallback A: speedtest-cli --secure"
         local tmp_output=$(mktemp)
 
         # Run speedtest with timeout (macOS-compatible)
@@ -1233,9 +1320,9 @@ collect_metrics() {
         rm -f "$tmp_output"
     fi
 
-    # Strategy 2: speedtest-cli without --secure (plain HTTP, might bypass some filters)
+    # Fallback B: speedtest-cli without --secure (plain HTTP, might bypass some filters)
     if [[ "$speedtest_success" == "false" ]]; then
-        log "Strategy 2: speedtest-cli standard"
+        log "Fallback B: speedtest-cli standard"
         local tmp_output=$(mktemp)
 
         # Run speedtest with timeout (macOS-compatible)
@@ -1277,95 +1364,6 @@ collect_metrics() {
             fi
         fi
         rm -f "$tmp_output"
-    fi
-
-    # Strategy 3: Ookla-like methodology against Cloudflare
-    #   - ICMP ping to speed.cloudflare.com (same server, real internet RTT)
-    #   - 4 parallel streams × 15s per direction (mirrors Ookla window)
-    #   - 400MB payload per stream — large enough that --max-time 15 always cuts first
-    #     (handles any realistic link speed without needing a probe phase)
-    if [[ "$speedtest_success" == "false" ]]; then
-        local _cf_host="speed.cloudflare.com"
-
-        # Step 1: Latency — ICMP ping to test server (bypasses curl/proxy issues)
-        log "Strategy 3: pinging ${_cf_host} for latency..."
-        local _raw_ping
-        _raw_ping=$(ping -c 8 -q "$_cf_host" 2>/dev/null | tail -1)
-        if echo "$_raw_ping" | grep -q "avg"; then
-            LATENCY_MS=$(echo "$_raw_ping" | awk -F'[=/]' '{printf "%.1f", $(NF-3)}')
-            JITTER_MS=$(echo "$_raw_ping"  | awk -F'[=/]' '{printf "%.2f", $(NF-1)}')
-        else
-            # ICMP blocked — fall back to gateway ping
-            while IFS='=' read -r _lk _lv; do
-                [[ "$_lk" =~ ^[A-Z_]+$ ]] && printf -v "$_lk" '%s' "$_lv"
-            done < <(measure_latency_ms)
-        fi
-        JITTER_P50=${JITTER_MS}; JITTER_P95=${JITTER_MS}
-        log "Latency: ${LATENCY_MS}ms  Jitter: ${JITTER_MS}ms"
-
-        # Step 2: Download — 2 parallel streams × 20 MB, 8s window
-        # 2 streams keeps fleet bandwidth sane (350 devices × 10 min).
-        # 20 MB is enough to measure 10–200 Mbps accurately within 8 seconds.
-        log "Strategy 3: 2-stream download..."
-        local _cf_tmp; _cf_tmp=$(mktemp -d)
-        for _i in 1 2; do
-            curl -s -o /dev/null -w "%{speed_download}\n" \
-                --connect-timeout 10 --max-time 8 \
-                "https://${_cf_host}/__down?bytes=20000000" \
-                > "${_cf_tmp}/dl_${_i}" 2>/dev/null &
-        done
-        wait
-
-        local _total_dl_bps=0 _dl_ok=false
-        for _i in 1 2; do
-            local _s; _s=$(tr -d ' \n' < "${_cf_tmp}/dl_${_i}" 2>/dev/null)
-            if is_positive_number "$_s" && [[ "$_s" != "0" ]]; then
-                _total_dl_bps=$(echo "scale=4; ${_total_dl_bps} + ${_s}" | bc 2>/dev/null || echo "$_total_dl_bps")
-                _dl_ok=true
-            fi
-        done
-        rm -rf "$_cf_tmp"
-
-        if [[ "$_dl_ok" == "true" ]]; then
-            DOWNLOAD_MBPS=$(echo "scale=2; $_total_dl_bps * 8 / 1000000" | bc 2>/dev/null || echo "0")
-            log "Download: ${DOWNLOAD_MBPS} Mbps"
-
-            # Step 3: Upload — 2 parallel streams × 15 MB, 8s window
-            log "Strategy 3: 2-stream upload..."
-            local _ul_tmp; _ul_tmp=$(mktemp -d)
-            for _i in 1 2; do
-                dd if=/dev/zero bs=1048576 count=15 2>/dev/null | \
-                curl -s -o /dev/null -w "%{speed_upload}\n" \
-                    --connect-timeout 10 --max-time 8 \
-                    -X POST --data-binary @- \
-                    "https://${_cf_host}/__up" \
-                    > "${_ul_tmp}/ul_${_i}" 2>/dev/null &
-            done
-            wait
-
-            local _total_ul_bps=0
-            for _i in 1 2; do
-                local _us; _us=$(tr -d ' \n' < "${_ul_tmp}/ul_${_i}" 2>/dev/null)
-                if is_positive_number "$_us" && [[ "$_us" != "0" ]]; then
-                    _total_ul_bps=$(echo "scale=4; ${_total_ul_bps} + ${_us}" | bc 2>/dev/null || echo "$_total_ul_bps")
-                fi
-            done
-            rm -rf "$_ul_tmp"
-
-            if is_positive_number "$_total_ul_bps" && [[ "$_total_ul_bps" != "0" ]]; then
-                UPLOAD_MBPS=$(echo "scale=2; $_total_ul_bps * 8 / 1000000" | bc 2>/dev/null || echo "0")
-                log "Upload: ${UPLOAD_MBPS} Mbps"
-            else
-                UPLOAD_MBPS="0"
-                log "Upload measurement failed"
-            fi
-
-            STATUS="success_cloudflare"
-            speedtest_success=true
-            log "Strategy 3 succeeded (Cloudflare) - Down: ${DOWNLOAD_MBPS} Mbps, Up: ${UPLOAD_MBPS} Mbps, Latency: ${LATENCY_MS}ms"
-        else
-            log "Strategy 3 failed: parallel streams returned no data"
-        fi
     fi
 
     # Strategy 4: Fast.com test (Netflix - often whitelisted by corporate)
