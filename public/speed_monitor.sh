@@ -1243,41 +1243,59 @@ collect_metrics() {
         JITTER_P50=${JITTER_MS}; JITTER_P95=${JITTER_MS}
         log "Latency: ${LATENCY_MS}ms  Jitter: ${JITTER_MS}ms"
 
-        # Download — 4 streams looping for ~7s; measure real bytes on $_ifc
-        log "Strategy 1: measuring download via ${_ifc} byte counters..."
-        local _b0 _t0 _b1 _t1 _dl_end
-        _b0=$(_if_ibytes); _t0=$(_epoch_ms)
-        _dl_end=$(( $(date +%s) + 7 ))
+        # Download — 4 streams for ~8s; sample $_ifc each second and keep the PEAK
+        # 1-second rate. Zscaler throttling is intermittent (the same instant can
+        # swing 0.4↔25 Mbps), so the average gets dragged down by dropouts. The
+        # peak reflects real achievable throughput, matching what users actually get.
+        log "Strategy 1: measuring download (peak 1s) via ${_ifc}..."
+        local _dl_end _peak_dl _prev _prevt _cur _curt _rate
+        _dl_end=$(( $(date +%s) + 8 ))
         for _i in 1 2 3 4; do
             ( while [ "$(date +%s)" -lt "$_dl_end" ]; do
-                curl -s -o /dev/null --max-time 8 "https://${_cf_host}/__down?bytes=25000000" 2>/dev/null
+                curl -s -o /dev/null --max-time 9 "https://${_cf_host}/__down?bytes=50000000" 2>/dev/null
               done ) &
         done
+        _peak_dl=0; _prev=$(_if_ibytes); _prevt=$(_epoch_ms)
+        while [ "$(date +%s)" -lt "$_dl_end" ]; do
+            sleep 1
+            _cur=$(_if_ibytes); _curt=$(_epoch_ms)
+            if is_positive_number "$_cur" && [[ "$_cur" -gt "$_prev" ]] && [[ "$_curt" -gt "$_prevt" ]]; then
+                _rate=$(awk "BEGIN{printf \"%.2f\", ($_cur-$_prev)*8/($_curt-$_prevt)/1000}")
+                awk "BEGIN{exit !($_rate > $_peak_dl)}" && _peak_dl=$_rate
+            fi
+            _prev=$_cur; _prevt=$_curt
+        done
         wait
-        _b1=$(_if_ibytes); _t1=$(_epoch_ms)
 
-        if is_positive_number "$_b0" && is_positive_number "$_b1" && [[ "$_b1" -gt "$_b0" ]]; then
-            # Mbps = bytes*8 / ms / 1000
-            DOWNLOAD_MBPS=$(awk "BEGIN{printf \"%.2f\", ($_b1-$_b0)*8/($_t1-$_t0)/1000}")
-            log "Download: ${DOWNLOAD_MBPS} Mbps (${_ifc} wire bytes)"
+        if awk "BEGIN{exit !($_peak_dl > 0)}"; then
+            DOWNLOAD_MBPS=$_peak_dl
+            log "Download: ${DOWNLOAD_MBPS} Mbps (peak 1s, ${_ifc})"
 
-            # Upload — 4 streams looping for ~7s; measure real bytes out on $_ifc
-            log "Strategy 1: measuring upload via ${_ifc} byte counters..."
-            local _o0 _s0 _o1 _s1 _ul_end
-            _o0=$(_if_obytes); _s0=$(_epoch_ms)
-            _ul_end=$(( $(date +%s) + 7 ))
+            # Upload — same peak-sampling approach
+            log "Strategy 1: measuring upload (peak 1s) via ${_ifc}..."
+            local _ul_end _peak_ul
+            _ul_end=$(( $(date +%s) + 8 ))
             for _i in 1 2 3 4; do
                 ( while [ "$(date +%s)" -lt "$_ul_end" ]; do
-                    dd if=/dev/zero bs=1048576 count=25 2>/dev/null | \
-                    curl -s -o /dev/null --max-time 8 -X POST --data-binary @- "https://${_cf_host}/__up" 2>/dev/null
+                    dd if=/dev/zero bs=1048576 count=50 2>/dev/null | \
+                    curl -s -o /dev/null --max-time 9 -X POST --data-binary @- "https://${_cf_host}/__up" 2>/dev/null
                   done ) &
             done
+            _peak_ul=0; _prev=$(_if_obytes); _prevt=$(_epoch_ms)
+            while [ "$(date +%s)" -lt "$_ul_end" ]; do
+                sleep 1
+                _cur=$(_if_obytes); _curt=$(_epoch_ms)
+                if is_positive_number "$_cur" && [[ "$_cur" -gt "$_prev" ]] && [[ "$_curt" -gt "$_prevt" ]]; then
+                    _rate=$(awk "BEGIN{printf \"%.2f\", ($_cur-$_prev)*8/($_curt-$_prevt)/1000}")
+                    awk "BEGIN{exit !($_rate > $_peak_ul)}" && _peak_ul=$_rate
+                fi
+                _prev=$_cur; _prevt=$_curt
+            done
             wait
-            _o1=$(_if_obytes); _s1=$(_epoch_ms)
 
-            if is_positive_number "$_o0" && is_positive_number "$_o1" && [[ "$_o1" -gt "$_o0" ]]; then
-                UPLOAD_MBPS=$(awk "BEGIN{printf \"%.2f\", ($_o1-$_o0)*8/($_s1-$_s0)/1000}")
-                log "Upload: ${UPLOAD_MBPS} Mbps (${_ifc} wire bytes)"
+            if awk "BEGIN{exit !($_peak_ul > 0)}"; then
+                UPLOAD_MBPS=$_peak_ul
+                log "Upload: ${UPLOAD_MBPS} Mbps (peak 1s, ${_ifc})"
             else
                 UPLOAD_MBPS="0"
                 log "Upload measurement failed (no byte delta on ${_ifc})"
@@ -1285,7 +1303,7 @@ collect_metrics() {
 
             STATUS="success_cloudflare"
             speedtest_success=true
-            log "Strategy 1 succeeded (Cloudflare wire-bytes) - Down: ${DOWNLOAD_MBPS} Mbps, Up: ${UPLOAD_MBPS} Mbps, Latency: ${LATENCY_MS}ms"
+            log "Strategy 1 succeeded (Cloudflare peak-1s) - Down: ${DOWNLOAD_MBPS} Mbps, Up: ${UPLOAD_MBPS} Mbps, Latency: ${LATENCY_MS}ms"
         else
             log "Strategy 1 failed: no download byte delta on ${_ifc}"
         fi
