@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SpeedMonitor v4.2.0 — Installer
+# SpeedMonitor v4.1.2 — Installer
 # Usage: curl -fsSL https://raw.githubusercontent.com/HV-Automation-Pod/speed-monitor/main/public/install.sh | bash
 #
 # What this does:
@@ -55,7 +55,7 @@ APP_DEST="$HOME/Applications/SpeedMonitor.app"
 
 log() { echo "[SpeedMonitor install] $*"; }
 
-log "Starting SpeedMonitor v4.2.0 installation..."
+log "Starting SpeedMonitor v4.1.2 installation..."
 
 # ── 0. Stop previous installation ─────────────────────────────────────────
 log "Stopping previous installation (if any)..."
@@ -192,7 +192,7 @@ launchctl bootstrap "gui/$(id -u)" "$APP_PLIST" 2>/dev/null || \
 log "App LaunchAgent loaded — SpeedMonitor.app starts at login"
 
 echo ""
-echo "SpeedMonitor v4.2.0 installation complete."
+echo "SpeedMonitor v4.1.2 installation complete."
 echo "  • First speed test runs within ~30 seconds"
 echo "  • Tests run every 10 minutes automatically"
 echo "  • Look for the SpeedMonitor icon in your menu bar"
