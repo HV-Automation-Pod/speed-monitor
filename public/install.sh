@@ -17,6 +17,7 @@ GITHUB_BASE="https://raw.githubusercontent.com/HV-Automation-Pod/speed-monitor/m
 # Accept overrides from env (used by jamf_deploy.sh and CI)
 APPS_SCRIPT_URL="${APPS_SCRIPT_URL:-https://script.google.com/macros/s/AKfycbx2lTMafG6Phra0d12t4WjqeOTmowKGVs8oIJsclQ8wEaVDHfkRAFMv8VPC41Ylgh7VPg/exec}"
 INGEST_TOKEN="${INGEST_TOKEN:-47ca74e6e5510bfb2188cd9b556f7b8cc0ab9662cdec4e03}"
+SERVER_URL="${SERVER_URL:-https://speed-monitor.riyan-b.workers.dev}"
 
 # ── Root guard (Jamf runs scripts as root) ─────────────────────────────────
 if [[ "$(id -u)" == "0" ]]; then
@@ -106,6 +107,9 @@ chmod 600 "$CONFIG_DIR/apps_script_url"
 
 printf '%s' "$INGEST_TOKEN" > "$CONFIG_DIR/ingest_token"
 chmod 600 "$CONFIG_DIR/ingest_token"
+
+# Dashboard server URL — overwrite any stale value (e.g. old Vercel URL)
+printf '%s' "$SERVER_URL" > "$CONFIG_DIR/server_url"
 
 log "Apps Script endpoint configured"
 
