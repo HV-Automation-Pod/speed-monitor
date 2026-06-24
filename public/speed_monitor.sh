@@ -1185,12 +1185,24 @@ collect_metrics() {
 
     local speedtest_success=false
 
-    # Strategy 1 (PRIMARY): Cloudflare — 2 parallel TCP streams, AVERAGED
-    # Two independent streams per direction; the per-stream speeds are averaged
-    # (not summed) to report a representative throughput. Primary because the
-    # single-connection speedtest-cli under-reports through corporate proxies.
+    # Strategy 1 (PRIMARY): Cloudflare — measure true wire throughput from the
+    # interface byte counters (netstat -ib), the same mechanism the app's live
+    # meter uses. curl's own speed numbers are unreliable through Zscaler
+    # (download under-reads during TCP slow-start; upload over-reads into the
+    # local proxy buffer). Counting actual bytes on the wire over a sustained
+    # 4-stream transfer matches Ookla closely (validated against Ookla Chennai).
     if [[ "$speedtest_success" == "false" ]]; then
         local _cf_host="speed.cloudflare.com"
+
+        # Active interface (default route); fall back to en0
+        local _ifc
+        _ifc=$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')
+        [[ -z "$_ifc" ]] && _ifc="en0"
+
+        # Cumulative interface byte counters (first matching row carries totals)
+        _if_ibytes() { netstat -ib | awk -v i="$_ifc" '$1==i{print $(NF-4); exit}'; }
+        _if_obytes() { netstat -ib | awk -v i="$_ifc" '$1==i{print $(NF-1); exit}'; }
+        _epoch_ms()  { python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || echo $(( $(date +%s) * 1000 )); }
 
         # Latency — ICMP ping to the test server (bypasses curl/proxy issues)
         log "Strategy 1: pinging ${_cf_host} for latency..."
@@ -1208,67 +1220,51 @@ collect_metrics() {
         JITTER_P50=${JITTER_MS}; JITTER_P95=${JITTER_MS}
         log "Latency: ${LATENCY_MS}ms  Jitter: ${JITTER_MS}ms"
 
-        # Download — 2 parallel streams × 20 MB, 8s window, AVERAGED
-        log "Strategy 1: 2-stream download (averaged)..."
-        local _cf_tmp; _cf_tmp=$(mktemp -d)
-        for _i in 1 2; do
-            curl -s -o /dev/null -w "%{speed_download}\n" \
-                --connect-timeout 10 --max-time 8 \
-                "https://${_cf_host}/__down?bytes=20000000" \
-                > "${_cf_tmp}/dl_${_i}" 2>/dev/null &
+        # Download — 4 streams looping for ~7s; measure real bytes on $_ifc
+        log "Strategy 1: measuring download via ${_ifc} byte counters..."
+        local _b0 _t0 _b1 _t1 _dl_end
+        _b0=$(_if_ibytes); _t0=$(_epoch_ms)
+        _dl_end=$(( $(date +%s) + 7 ))
+        for _i in 1 2 3 4; do
+            ( while [ "$(date +%s)" -lt "$_dl_end" ]; do
+                curl -s -o /dev/null --max-time 8 "https://${_cf_host}/__down?bytes=25000000" 2>/dev/null
+              done ) &
         done
         wait
+        _b1=$(_if_ibytes); _t1=$(_epoch_ms)
 
-        local _dl_sum=0 _dl_n=0
-        for _i in 1 2; do
-            local _s; _s=$(tr -d ' \n' < "${_cf_tmp}/dl_${_i}" 2>/dev/null)
-            if is_positive_number "$_s" && [[ "$_s" != "0" ]]; then
-                _dl_sum=$(echo "scale=4; ${_dl_sum} + ${_s}" | bc 2>/dev/null || echo "$_dl_sum")
-                _dl_n=$((_dl_n + 1))
-            fi
-        done
-        rm -rf "$_cf_tmp"
+        if is_positive_number "$_b0" && is_positive_number "$_b1" && [[ "$_b1" -gt "$_b0" ]]; then
+            # Mbps = bytes*8 / ms / 1000
+            DOWNLOAD_MBPS=$(awk "BEGIN{printf \"%.2f\", ($_b1-$_b0)*8/($_t1-$_t0)/1000}")
+            log "Download: ${DOWNLOAD_MBPS} Mbps (${_ifc} wire bytes)"
 
-        if [[ "$_dl_n" -gt 0 ]]; then
-            DOWNLOAD_MBPS=$(echo "scale=2; $_dl_sum * 8 / 1000000 / $_dl_n" | bc 2>/dev/null || echo "0")
-            log "Download: ${DOWNLOAD_MBPS} Mbps (avg of $_dl_n streams)"
-
-            # Upload — 2 parallel streams × 15 MB, 8s window, AVERAGED
-            log "Strategy 1: 2-stream upload (averaged)..."
-            local _ul_tmp; _ul_tmp=$(mktemp -d)
-            for _i in 1 2; do
-                dd if=/dev/zero bs=1048576 count=15 2>/dev/null | \
-                curl -s -o /dev/null -w "%{speed_upload}\n" \
-                    --connect-timeout 10 --max-time 8 \
-                    -X POST --data-binary @- \
-                    "https://${_cf_host}/__up" \
-                    > "${_ul_tmp}/ul_${_i}" 2>/dev/null &
+            # Upload — 4 streams looping for ~7s; measure real bytes out on $_ifc
+            log "Strategy 1: measuring upload via ${_ifc} byte counters..."
+            local _o0 _s0 _o1 _s1 _ul_end
+            _o0=$(_if_obytes); _s0=$(_epoch_ms)
+            _ul_end=$(( $(date +%s) + 7 ))
+            for _i in 1 2 3 4; do
+                ( while [ "$(date +%s)" -lt "$_ul_end" ]; do
+                    dd if=/dev/zero bs=1048576 count=25 2>/dev/null | \
+                    curl -s -o /dev/null --max-time 8 -X POST --data-binary @- "https://${_cf_host}/__up" 2>/dev/null
+                  done ) &
             done
             wait
+            _o1=$(_if_obytes); _s1=$(_epoch_ms)
 
-            local _ul_sum=0 _ul_n=0
-            for _i in 1 2; do
-                local _us; _us=$(tr -d ' \n' < "${_ul_tmp}/ul_${_i}" 2>/dev/null)
-                if is_positive_number "$_us" && [[ "$_us" != "0" ]]; then
-                    _ul_sum=$(echo "scale=4; ${_ul_sum} + ${_us}" | bc 2>/dev/null || echo "$_ul_sum")
-                    _ul_n=$((_ul_n + 1))
-                fi
-            done
-            rm -rf "$_ul_tmp"
-
-            if [[ "$_ul_n" -gt 0 ]]; then
-                UPLOAD_MBPS=$(echo "scale=2; $_ul_sum * 8 / 1000000 / $_ul_n" | bc 2>/dev/null || echo "0")
-                log "Upload: ${UPLOAD_MBPS} Mbps (avg of $_ul_n streams)"
+            if is_positive_number "$_o0" && is_positive_number "$_o1" && [[ "$_o1" -gt "$_o0" ]]; then
+                UPLOAD_MBPS=$(awk "BEGIN{printf \"%.2f\", ($_o1-$_o0)*8/($_s1-$_s0)/1000}")
+                log "Upload: ${UPLOAD_MBPS} Mbps (${_ifc} wire bytes)"
             else
                 UPLOAD_MBPS="0"
-                log "Upload measurement failed"
+                log "Upload measurement failed (no byte delta on ${_ifc})"
             fi
 
             STATUS="success_cloudflare"
             speedtest_success=true
-            log "Strategy 1 succeeded (Cloudflare 2-stream avg) - Down: ${DOWNLOAD_MBPS} Mbps, Up: ${UPLOAD_MBPS} Mbps, Latency: ${LATENCY_MS}ms"
+            log "Strategy 1 succeeded (Cloudflare wire-bytes) - Down: ${DOWNLOAD_MBPS} Mbps, Up: ${UPLOAD_MBPS} Mbps, Latency: ${LATENCY_MS}ms"
         else
-            log "Strategy 1 failed: parallel streams returned no data"
+            log "Strategy 1 failed: no download byte delta on ${_ifc}"
         fi
     fi
 
