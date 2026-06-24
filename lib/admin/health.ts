@@ -6,9 +6,11 @@ export function computeHealthStatus(
   baselineStdDev: number | null,
   lastSeenAt: string | null,
 ): HealthStatus {
-  if (!lastSeenAt) return 'red'
+  // Offline / no recent data is NOT "Critical" — it's simply unassessable.
+  // (Critical is reserved for devices that ARE reporting but performing badly.)
+  if (!lastSeenAt) return 'unknown'
   const hoursSinceLastSeen = (Date.now() - new Date(lastSeenAt).getTime()) / 3_600_000
-  if (hoursSinceLastSeen > 24) return 'red'
+  if (hoursSinceLastSeen > 24) return 'unknown'
   if (baselineMean == null || baselineStdDev == null || lastDownload == null) return 'unknown'
   const stdDev = baselineStdDev > 0 ? baselineStdDev : 0.5
   const deviations = (baselineMean - lastDownload) / stdDev
@@ -36,5 +38,5 @@ export const HEALTH_LABELS: Record<HealthStatus, string> = {
   green:   'Healthy',
   yellow:  'Degraded',
   red:     'Critical',
-  unknown: 'No Baseline',
+  unknown: 'No Data',
 }

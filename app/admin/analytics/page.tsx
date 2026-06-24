@@ -167,7 +167,10 @@ async function getDowData(): Promise<DowRow[]> {
 
   for (const row of rows) {
     if (row.timestamp_utc == null || row.download_mbps == null) continue
-    const dow = new Date(row.timestamp_utc).getUTCDay()
+    // Bucket by IST day — a 00:00-05:30 IST sample is the previous day in UTC,
+    // which would mislabel weekday performance for an India fleet.
+    const istMs = new Date(row.timestamp_utc).getTime() + 5.5 * 3_600_000
+    const dow = new Date(istMs).getUTCDay()
     const entry = byDow.get(dow) ?? { sum: 0, count: 0 }
     entry.sum += row.download_mbps
     entry.count++
@@ -215,7 +218,7 @@ export default async function AnalyticsPage() {
       {/* Day-of-Week section */}
       <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-6 mb-6">
         <h2 className="text-base font-semibold text-gray-900 mb-1">Day-of-Week Performance</h2>
-        <p className="text-xs text-gray-400 mb-4">Fleet avg download by day · 30-day window · UTC days</p>
+        <p className="text-xs text-gray-400 mb-4">Fleet avg download by day · 30-day window · IST days</p>
         <DowBarChart rows={dowRows} />
       </div>
     </div>

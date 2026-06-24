@@ -43,33 +43,25 @@ async function getFleetStats() {
 }
 
 async function getDevicesForHeatmap(): Promise<DeviceCell[]> {
-  const { data: rawResults } = await supabaseAdmin
-    .from('speed_results')
-    .select('device_id, hostname, download_mbps, timestamp_utc')
-    .order('timestamp_utc', { ascending: false })
-    .limit(2000)
+  // Use the same DISTINCT-ON RPC the Devices page uses, so both surfaces report
+  // the identical device set (previously this used limit(2000), which silently
+  // dropped devices and disagreed with the Devices page count).
+  const [rpcResult, baselinesResult] = await Promise.all([
+    supabaseAdmin.rpc('get_latest_per_device'),
+    supabaseAdmin
+      .from('device_baselines')
+      .select('device_id, mean, std_dev')
+      .eq('metric', 'download_mbps'),
+  ])
 
-  const seen = new Set<string>()
-  const lastPerDevice: Array<{
+  const lastPerDevice = (rpcResult.data as Array<{
     device_id: string
     hostname: string | null
     download_mbps: number | null
     timestamp_utc: string | null
-  }> = []
+  }> | null) ?? []
 
-  for (const row of rawResults ?? []) {
-    if (!seen.has(row.device_id)) {
-      seen.add(row.device_id)
-      lastPerDevice.push(row)
-    }
-  }
-
-  const { data: baselines } = await supabaseAdmin
-    .from('device_baselines')
-    .select('device_id, mean, std_dev')
-    .eq('metric', 'download_mbps')
-
-  const baselineMap = new Map((baselines ?? []).map((b) => [b.device_id, b]))
+  const baselineMap = new Map((baselinesResult.data ?? []).map((b) => [b.device_id, b]))
 
   return lastPerDevice.map((r) => {
     const baseline = baselineMap.get(r.device_id)
@@ -84,19 +76,23 @@ async function getDevicesForHeatmap(): Promise<DeviceCell[]> {
 }
 
 async function getFleetSparkline(): Promise<{ value: number }[]> {
-  const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+  const windowStart = Date.now() - 24 * 60 * 60 * 1000
   const { data } = await supabaseAdmin
     .from('speed_results')
     .select('timestamp_utc, download_mbps')
-    .gte('timestamp_utc', since24h)
+    .gte('timestamp_utc', new Date(windowStart).toISOString())
     .order('timestamp_utc', { ascending: true })
 
   const rows = (data ?? []).filter(r => r.download_mbps != null)
-  // Bucket into 24 hourly slots
+  // 24 hourly buckets indexed by ELAPSED hours within the rolling window
+  // (bucket 0 = oldest, 23 = most recent) → strictly chronological, and
+  // timezone-independent. (Previously indexed by absolute UTC hour 0-23, which
+  // scrambled the order across a midnight boundary.)
   const buckets: number[][] = Array.from({ length: 24 }, () => [])
   for (const row of rows) {
-    const hour = new Date(row.timestamp_utc as string).getUTCHours()
-    buckets[hour].push(row.download_mbps as number)
+    const elapsedH = Math.floor((new Date(row.timestamp_utc as string).getTime() - windowStart) / 3_600_000)
+    const idx = Math.min(23, Math.max(0, elapsedH))
+    buckets[idx].push(row.download_mbps as number)
   }
   return buckets.map(b =>
     b.length > 0 ? { value: Math.round((b.reduce((a, c) => a + c, 0) / b.length) * 10) / 10 } : { value: 0 }

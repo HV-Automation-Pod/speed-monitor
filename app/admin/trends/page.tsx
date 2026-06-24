@@ -18,25 +18,58 @@ async function getTrendsData(days: number) {
     .toISOString()
     .slice(0, 10)
 
-  const { data } = await supabaseAdmin
+  // sumDownload/sumUpload are sums of per-test values; totalTests is the count,
+  // so sumX/totalTests = mean. Both the pre-aggregated and live paths feed this
+  // identically (agg contributes avg*count; live contributes raw values + count).
+  const byDate = new Map<
+    string,
+    { sumDownload: number; sumUpload: number; totalTests: number }
+  >()
+
+  // 1) Historical: pre-computed daily aggregates.
+  const { data: aggData } = await supabaseAdmin
     .from('daily_aggregates')
     .select('date, avg_download, avg_upload, test_count')
     .gte('date', sinceDate)
     .order('date', { ascending: true })
 
-  const rows = data ?? []
-
-  const byDate = new Map<
-    string,
-    { sumDownload: number; sumUpload: number; totalTests: number }
-  >()
-  for (const row of rows) {
+  for (const row of aggData ?? []) {
     const key = row.date as string
     const entry = byDate.get(key) ?? { sumDownload: 0, sumUpload: 0, totalTests: 0 }
     const count = (row.test_count as number) ?? 0
     entry.sumDownload += ((row.avg_download as number) ?? 0) * count
     entry.sumUpload += ((row.avg_upload as number) ?? 0) * count
     entry.totalTests += count
+    byDate.set(key, entry)
+  }
+
+  // 2) Self-heal: live-aggregate every day AFTER the newest pre-computed date
+  // straight from speed_results, so the chart never goes blank when the
+  // daily_aggregates job is behind. Post-outage this window is tiny; it only
+  // grows as fast as new data arrives. (No overlap with step 1 → no double count.)
+  const latestAgg = aggData && aggData.length ? (aggData[aggData.length - 1].date as string) : null
+  const liveSinceDate = latestAgg
+    ? new Date(new Date(latestAgg + 'T00:00:00Z').getTime() + 86_400_000).toISOString().slice(0, 10)
+    : sinceDate
+
+  const { data: raw } = await supabaseAdmin
+    .from('speed_results')
+    .select('timestamp_utc, download_mbps, upload_mbps')
+    .gte('timestamp_utc', liveSinceDate + 'T00:00:00Z')
+    // DESCENDING so that if the live window ever exceeds the cap, truncation
+    // drops the OLDEST live dates (nearest the aggregate boundary) and keeps the
+    // newest — the chart never re-blanks at "today". Output is re-sorted by date
+    // below, so fetch order doesn't change the rendered series.
+    .order('timestamp_utc', { ascending: false })
+    .limit(5000)
+
+  for (const row of raw ?? []) {
+    if (row.timestamp_utc == null) continue
+    const key = (row.timestamp_utc as string).slice(0, 10) // UTC date — matches daily_aggregates
+    const entry = byDate.get(key) ?? { sumDownload: 0, sumUpload: 0, totalTests: 0 }
+    if (row.download_mbps != null) entry.sumDownload += row.download_mbps
+    if (row.upload_mbps != null) entry.sumUpload += row.upload_mbps
+    entry.totalTests += 1
     byDate.set(key, entry)
   }
 
@@ -63,7 +96,10 @@ async function getTimeOfDayData(days: number) {
   const byHour = new Map<number, { sum: number; count: number }>()
   for (const row of rows) {
     if (row.timestamp_utc == null || row.download_mbps == null) continue
-    const hour = new Date(row.timestamp_utc).getUTCHours()
+    // Bucket by IST (UTC+5:30) hour — the fleet is in India, so "hour of day"
+    // must be local or the peak/quiet hours are shifted 5.5h.
+    const istMs = new Date(row.timestamp_utc).getTime() + 5.5 * 3_600_000
+    const hour = new Date(istMs).getUTCHours()
     const entry = byHour.get(hour) ?? { sum: 0, count: 0 }
     entry.sum += row.download_mbps
     entry.count += 1
@@ -256,7 +292,7 @@ export default async function TrendsPage({
       {/* Time of Day heatmap */}
       <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-6 mb-6">
         <h2 className="text-base font-semibold text-gray-900 mb-1">Performance by Hour of Day</h2>
-        <p className="text-xs text-gray-400 mb-4">Average download speed per hour · {days}-day window · UTC</p>
+        <p className="text-xs text-gray-400 mb-4">Average download speed per hour · {days}-day window · IST</p>
         <TimeOfDayHeatmap data={timeOfDayData} />
       </div>
 
