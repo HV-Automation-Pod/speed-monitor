@@ -31,6 +31,8 @@ interface Props {
   chart24hData: ChartPoint[]
   last10Tests: SpeedResult[]
   recommendations: string[]
+  /** Optional network-scope selector (rendered by the server page). */
+  ssidFilter?: React.ReactNode
 }
 
 function formatDate(iso: string) {
@@ -77,6 +79,7 @@ export default function EmployeeDashboard({
   chart24hData,
   last10Tests,
   recommendations,
+  ssidFilter,
 }: Props) {
   const showRecommendations = hasRealRecommendations(recommendations)
 
@@ -92,7 +95,10 @@ export default function EmployeeDashboard({
             <p className="text-sm text-gray-500 mt-0.5">{deviceId}</p>
           )}
         </div>
-        <ShareButton deviceId={deviceId} />
+        <div className="flex items-center gap-2">
+          {ssidFilter}
+          <ShareButton deviceId={deviceId} />
+        </div>
       </div>
 
       {/* Health + key stats — always visible */}

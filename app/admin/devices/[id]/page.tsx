@@ -3,10 +3,12 @@ import { Suspense } from 'react'
 import { supabaseAdmin } from '@/lib/supabase/admin'
 import { computeHealthStatus, HEALTH_LABELS, HealthStatus } from '@/lib/admin/health'
 import { generateRecommendations } from '@/lib/admin/recommendations'
+import { isScoped, ALL_SSIDS } from '@/lib/admin/ssid'
 import DeviceSpeedChart from '@/components/admin/DeviceSpeedChart'
 import DeviceTabs from '@/components/admin/DeviceTabs'
 import DeleteDeviceButton from '@/components/admin/DeleteDeviceButton'
 import LocalTime from '@/components/admin/LocalTime'
+import SsidFilter from '@/components/admin/SsidFilter'
 
 export const dynamic = 'force-dynamic'
 
@@ -42,19 +44,43 @@ export default async function DeviceDetailPage({
   searchParams,
 }: {
   params: Promise<{ id: string }>
-  searchParams: Promise<{ tab?: string; page?: string }>
+  searchParams: Promise<{ tab?: string; page?: string; ssid?: string }>
 }) {
   // Await params — Next.js 16 requirement
   const { id: deviceId } = await params
-  const { page: pageStr } = await searchParams
+  const { page: pageStr, ssid: ssidParam } = await searchParams
   const historyPage = Math.max(1, parseInt(pageStr ?? '1', 10))
+  // Per-device default is "all networks" so home/café data isn't hidden; the
+  // dropdown lets you isolate office (HypervergeHQ). URL-only (no fleet cookie).
+  const ssid = ssidParam ?? ALL_SSIDS
+  const scopeLabel = ssid === ALL_SSIDS ? 'all networks' : ssid
 
   const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
   const since60d = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString()
+  const since7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()
+
+  // The speed charts scope to the selected SSID; everything else (health,
+  // recommendations, full history, baseline) stays whole-device.
+  let chart24hQuery = supabaseAdmin
+    .from('speed_results')
+    .select('timestamp_utc, download_mbps, upload_mbps')
+    .eq('device_id', deviceId)
+    .gte('timestamp_utc', since24h)
+    .order('timestamp_utc', { ascending: true })
+  if (isScoped(ssid)) chart24hQuery = chart24hQuery.eq('ssid', ssid)
+
+  let chart7dQuery = supabaseAdmin
+    .from('speed_results')
+    .select('timestamp_utc, download_mbps, upload_mbps')
+    .eq('device_id', deviceId)
+    .gte('timestamp_utc', since7d)
+    .order('timestamp_utc', { ascending: true })
+    .limit(1500)
+  if (isScoped(ssid)) chart7dQuery = chart7dQuery.eq('ssid', ssid)
 
   // Parallel data fetching
-  const [last20Result, chart24hResult, baselineResult, chart7dResult, historyResult] = await Promise.all([
-    // 1. Last 20 for health / recommendations / wifi tab
+  const [last20Result, chart24hResult, baselineResult, chart7dResult, historyResult, deviceSsidsResult] = await Promise.all([
+    // 1. Last 20 for health / recommendations / wifi tab (all networks)
     supabaseAdmin
       .from('speed_results')
       .select(
@@ -63,13 +89,8 @@ export default async function DeviceDetailPage({
       .eq('device_id', deviceId)
       .order('timestamp_utc', { ascending: false })
       .limit(20),
-    // 2. Last 24h for chart
-    supabaseAdmin
-      .from('speed_results')
-      .select('timestamp_utc, download_mbps, upload_mbps')
-      .eq('device_id', deviceId)
-      .gte('timestamp_utc', since24h)
-      .order('timestamp_utc', { ascending: true }),
+    // 2. Last 24h for chart (SSID-scoped)
+    chart24hQuery,
     // 3. Device baseline
     supabaseAdmin
       .from('device_baselines')
@@ -77,15 +98,9 @@ export default async function DeviceDetailPage({
       .eq('device_id', deviceId)
       .eq('metric', 'download_mbps')
       .maybeSingle(),
-    // 4. Last 7 days for chart toggle
-    supabaseAdmin
-      .from('speed_results')
-      .select('timestamp_utc, download_mbps, upload_mbps')
-      .eq('device_id', deviceId)
-      .gte('timestamp_utc', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString())
-      .order('timestamp_utc', { ascending: true })
-      .limit(1500),
-    // 5. Paginated 60-day history for history tab
+    // 4. Last 7 days for chart toggle (SSID-scoped)
+    chart7dQuery,
+    // 5. Paginated 60-day history for history tab (all networks — shows SSID per row)
     supabaseAdmin
       .from('speed_results')
       .select('id, timestamp_utc, download_mbps, upload_mbps, latency_ms, jitter_ms, ssid, status', { count: 'exact' })
@@ -93,6 +108,14 @@ export default async function DeviceDetailPage({
       .gte('timestamp_utc', since60d)
       .order('timestamp_utc', { ascending: false })
       .range((historyPage - 1) * HISTORY_PER_PAGE, historyPage * HISTORY_PER_PAGE - 1),
+    // 6. Networks this device has used (for the dropdown)
+    supabaseAdmin
+      .from('speed_results')
+      .select('ssid')
+      .eq('device_id', deviceId)
+      .gte('timestamp_utc', since60d)
+      .not('ssid', 'is', null)
+      .limit(5000),
   ])
 
   const last20Tests = last20Result.data ?? []
@@ -100,6 +123,16 @@ export default async function DeviceDetailPage({
   const chart7dData = chart7dResult.data ?? []
   const baseline = baselineResult.data
   const historyTests = historyResult.data ?? []
+
+  // Build SSID options scoped to this device.
+  const deviceSsidCounts = new Map<string, number>()
+  for (const r of deviceSsidsResult.data ?? []) {
+    const s = (r.ssid as string | null) ?? ''
+    if (s) deviceSsidCounts.set(s, (deviceSsidCounts.get(s) ?? 0) + 1)
+  }
+  const ssidOptions = Array.from(deviceSsidCounts.entries())
+    .map(([ssid, count]) => ({ ssid, count }))
+    .sort((a, b) => b.count - a.count)
   const historyTotal = historyResult.count ?? 0
   const historyFrom = historyTotal === 0 ? 0 : (historyPage - 1) * HISTORY_PER_PAGE + 1
   const historyTo = Math.min(historyPage * HISTORY_PER_PAGE, historyTotal)
@@ -182,8 +215,16 @@ export default async function DeviceDetailPage({
             {{
               overview: (
                 <div className="space-y-6">
-                  {/* Speed chart with 24h/7d toggle */}
+                  {/* Speed chart with 24h/7d toggle — scoped to the selected network */}
                   <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+                    <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
+                      <h2 className="text-base font-semibold text-gray-900">
+                        Speed over time · <span className="font-normal text-gray-500">{scopeLabel}</span>
+                      </h2>
+                      {ssidOptions.length > 1 && (
+                        <SsidFilter current={ssid} options={ssidOptions} persist={false} />
+                      )}
+                    </div>
                     <DeviceSpeedChart data24h={chart24hData} data7d={chart7dData} />
                   </div>
 

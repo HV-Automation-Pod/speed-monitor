@@ -11,16 +11,22 @@ interface SsidOption {
 interface SsidFilterProps {
   current: string
   options: SsidOption[]
+  /** When true (default), the choice persists across pages via cookie. Per-device
+   *  pages pass false so a single device's network choice doesn't change the
+   *  fleet-wide default. */
+  persist?: boolean
 }
 
-export default function SsidFilter({ current, options }: SsidFilterProps) {
+export default function SsidFilter({ current, options, persist = true }: SsidFilterProps) {
   const router = useRouter()
   const pathname = usePathname()
   const searchParams = useSearchParams()
 
   function onChange(value: string) {
-    // Persist as a cookie so the scope sticks across page navigation (1 year).
-    document.cookie = `${SSID_COOKIE}=${encodeURIComponent(value)}; path=/; max-age=31536000; samesite=lax`
+    if (persist) {
+      // Persist as a cookie so the scope sticks across page navigation (1 year).
+      document.cookie = `${SSID_COOKIE}=${encodeURIComponent(value)}; path=/; max-age=31536000; samesite=lax`
+    }
     const params = new URLSearchParams(searchParams.toString())
     params.set('ssid', value)
     router.push(`${pathname}?${params.toString()}`)
