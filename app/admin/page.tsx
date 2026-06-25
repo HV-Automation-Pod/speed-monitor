@@ -1,10 +1,13 @@
 import Link from 'next/link'
 import { supabaseAdmin } from '@/lib/supabase/admin'
 import { computeHealthStatus, HealthStatus } from '@/lib/admin/health'
+import { isScoped, ALL_SSIDS } from '@/lib/admin/ssid'
+import { resolveSsid, getAvailableSsids } from '@/lib/admin/ssid-server'
 import StatCard from '@/components/admin/StatCard'
 import DeviceHeatmap from '@/components/admin/DeviceHeatmap'
 import HealthSummaryStrip from '@/components/admin/HealthSummaryStrip'
 import Sparkline from '@/components/admin/Sparkline'
+import SsidFilter from '@/components/admin/SsidFilter'
 
 export const dynamic = 'force-dynamic'
 
@@ -15,13 +18,15 @@ interface DeviceCell {
   last_download: number | null
 }
 
-async function getFleetStats() {
+async function getFleetStats(ssid: string) {
   const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
 
-  const { data } = await supabaseAdmin
+  let query = supabaseAdmin
     .from('speed_results')
     .select('device_id, download_mbps, upload_mbps, latency_ms')
     .gte('timestamp_utc', since24h)
+  if (isScoped(ssid)) query = query.eq('ssid', ssid)
+  const { data } = await query
 
   const rows = data ?? []
   const deviceIds = new Set(rows.map((r) => r.device_id))
@@ -42,26 +47,46 @@ async function getFleetStats() {
   }
 }
 
-async function getDevicesForHeatmap(): Promise<DeviceCell[]> {
-  // Use the same DISTINCT-ON RPC the Devices page uses, so both surfaces report
-  // the identical device set (previously this used limit(2000), which silently
-  // dropped devices and disagreed with the Devices page count).
-  const [rpcResult, baselinesResult] = await Promise.all([
-    supabaseAdmin.rpc('get_latest_per_device'),
-    supabaseAdmin
-      .from('device_baselines')
-      .select('device_id, mean, std_dev')
-      .eq('metric', 'download_mbps'),
-  ])
-
-  const lastPerDevice = (rpcResult.data as Array<{
+async function getDevicesForHeatmap(ssid: string): Promise<DeviceCell[]> {
+  type LatestRow = {
     device_id: string
     hostname: string | null
     download_mbps: number | null
     timestamp_utc: string | null
-  }> | null) ?? []
+  }
 
-  const baselineMap = new Map((baselinesResult.data ?? []).map((b) => [b.device_id, b]))
+  // "All networks" → DISTINCT-ON RPC (latest result per device, any network),
+  // matching the Devices page. A specific network → latest result per device
+  // ON that SSID (the RPC has no ssid arg), deduped from a filtered query —
+  // the single-SSID result set is small, so this never truncates.
+  const baselinesPromise = supabaseAdmin
+    .from('device_baselines')
+    .select('device_id, mean, std_dev')
+    .eq('metric', 'download_mbps')
+
+  let lastPerDevice: LatestRow[]
+  if (isScoped(ssid)) {
+    const { data } = await supabaseAdmin
+      .from('speed_results')
+      .select('device_id, hostname, download_mbps, timestamp_utc')
+      .eq('ssid', ssid)
+      .order('timestamp_utc', { ascending: false })
+      .limit(5000)
+    const seen = new Set<string>()
+    lastPerDevice = []
+    for (const row of (data as LatestRow[] | null) ?? []) {
+      if (!seen.has(row.device_id)) {
+        seen.add(row.device_id)
+        lastPerDevice.push(row)
+      }
+    }
+  } else {
+    const { data } = await supabaseAdmin.rpc('get_latest_per_device')
+    lastPerDevice = (data as LatestRow[] | null) ?? []
+  }
+
+  const { data: baselines } = await baselinesPromise
+  const baselineMap = new Map((baselines ?? []).map((b) => [b.device_id, b]))
 
   return lastPerDevice.map((r) => {
     const baseline = baselineMap.get(r.device_id)
@@ -75,13 +100,15 @@ async function getDevicesForHeatmap(): Promise<DeviceCell[]> {
   })
 }
 
-async function getFleetSparkline(): Promise<{ value: number }[]> {
+async function getFleetSparkline(ssid: string): Promise<{ value: number }[]> {
   const windowStart = Date.now() - 24 * 60 * 60 * 1000
-  const { data } = await supabaseAdmin
+  let query = supabaseAdmin
     .from('speed_results')
     .select('timestamp_utc, download_mbps')
     .gte('timestamp_utc', new Date(windowStart).toISOString())
     .order('timestamp_utc', { ascending: true })
+  if (isScoped(ssid)) query = query.eq('ssid', ssid)
+  const { data } = await query
 
   const rows = (data ?? []).filter(r => r.download_mbps != null)
   // 24 hourly buckets indexed by ELAPSED hours within the rolling window
@@ -110,11 +137,19 @@ function relativeTime(isoString: string | null): string {
   return `${Math.floor(hours / 24)}d ago`
 }
 
-export default async function AdminPage() {
-  const [stats, devices, sparklineData] = await Promise.all([
-    getFleetStats(),
-    getDevicesForHeatmap(),
-    getFleetSparkline(),
+export default async function AdminPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ ssid?: string }>
+}) {
+  const ssid = await resolveSsid((await searchParams).ssid)
+  const scopeLabel = ssid === ALL_SSIDS ? 'all networks' : ssid
+
+  const [stats, devices, sparklineData, ssidOptions] = await Promise.all([
+    getFleetStats(ssid),
+    getDevicesForHeatmap(ssid),
+    getFleetSparkline(ssid),
+    getAvailableSsids(),
   ])
 
   const healthCounts = {
@@ -128,9 +163,14 @@ export default async function AdminPage() {
   return (
     <div className="p-8">
       {/* Page header */}
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold text-gray-900">Fleet Overview</h1>
-        <p className="text-sm text-gray-500 mt-1">Network performance across all devices · last 24 hours</p>
+      <div className="mb-6 flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Fleet Overview</h1>
+          <p className="text-sm text-gray-500 mt-1">
+            Network performance · last 24 hours · <span className="font-medium text-gray-700">{scopeLabel}</span>
+          </p>
+        </div>
+        <SsidFilter current={ssid} options={ssidOptions} />
       </div>
 
       {/* Health summary strip */}

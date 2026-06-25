@@ -1,9 +1,12 @@
 import Link from 'next/link'
 import { supabaseAdmin } from '@/lib/supabase/admin'
+import { isScoped, ALL_SSIDS } from '@/lib/admin/ssid'
+import { resolveSsid, getAvailableSsids } from '@/lib/admin/ssid-server'
 import TrendsChart from '@/components/admin/TrendsChart'
 import TimeOfDayHeatmap from '@/components/admin/TimeOfDayHeatmap'
 import WifiBandChart from '@/components/admin/WifiBandChart'
 import VpnStatsSection from '@/components/admin/VpnStatsSection'
+import SsidFilter from '@/components/admin/SsidFilter'
 
 export const dynamic = 'force-dynamic'
 
@@ -11,12 +14,14 @@ const VALID_DAYS = [7, 30, 60, 90]
 
 interface TrendsSearchParams {
   days?: string
+  ssid?: string
 }
 
-async function getTrendsData(days: number) {
+async function getTrendsData(days: number, ssid: string) {
   const sinceDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
     .toISOString()
     .slice(0, 10)
+  const scoped = isScoped(ssid)
 
   // sumDownload/sumUpload are sums of per-test values; totalTests is the count,
   // so sumX/totalTests = mean. Both the pre-aggregated and live paths feed this
@@ -26,42 +31,45 @@ async function getTrendsData(days: number) {
     { sumDownload: number; sumUpload: number; totalTests: number }
   >()
 
-  // 1) Historical: pre-computed daily aggregates.
-  const { data: aggData } = await supabaseAdmin
-    .from('daily_aggregates')
-    .select('date, avg_download, avg_upload, test_count')
-    .gte('date', sinceDate)
-    .order('date', { ascending: true })
+  // 1) Historical: pre-computed daily aggregates — only when NOT scoped to a
+  // network (daily_aggregates is fleet-wide, not broken out by SSID).
+  let liveSinceDate = sinceDate
+  if (!scoped) {
+    const { data: aggData } = await supabaseAdmin
+      .from('daily_aggregates')
+      .select('date, avg_download, avg_upload, test_count')
+      .gte('date', sinceDate)
+      .order('date', { ascending: true })
 
-  for (const row of aggData ?? []) {
-    const key = row.date as string
-    const entry = byDate.get(key) ?? { sumDownload: 0, sumUpload: 0, totalTests: 0 }
-    const count = (row.test_count as number) ?? 0
-    entry.sumDownload += ((row.avg_download as number) ?? 0) * count
-    entry.sumUpload += ((row.avg_upload as number) ?? 0) * count
-    entry.totalTests += count
-    byDate.set(key, entry)
+    for (const row of aggData ?? []) {
+      const key = row.date as string
+      const entry = byDate.get(key) ?? { sumDownload: 0, sumUpload: 0, totalTests: 0 }
+      const count = (row.test_count as number) ?? 0
+      entry.sumDownload += ((row.avg_download as number) ?? 0) * count
+      entry.sumUpload += ((row.avg_upload as number) ?? 0) * count
+      entry.totalTests += count
+      byDate.set(key, entry)
+    }
+
+    // Self-heal: live-aggregate days AFTER the newest aggregate so the chart
+    // never blanks when the aggregate job is behind (no overlap → no double count).
+    const latestAgg = aggData && aggData.length ? (aggData[aggData.length - 1].date as string) : null
+    liveSinceDate = latestAgg
+      ? new Date(new Date(latestAgg + 'T00:00:00Z').getTime() + 86_400_000).toISOString().slice(0, 10)
+      : sinceDate
   }
 
-  // 2) Self-heal: live-aggregate every day AFTER the newest pre-computed date
-  // straight from speed_results, so the chart never goes blank when the
-  // daily_aggregates job is behind. Post-outage this window is tiny; it only
-  // grows as fast as new data arrives. (No overlap with step 1 → no double count.)
-  const latestAgg = aggData && aggData.length ? (aggData[aggData.length - 1].date as string) : null
-  const liveSinceDate = latestAgg
-    ? new Date(new Date(latestAgg + 'T00:00:00Z').getTime() + 86_400_000).toISOString().slice(0, 10)
-    : sinceDate
-
-  const { data: raw } = await supabaseAdmin
+  // 2) Live speed_results. Scoped → the FULL window, filtered to this SSID
+  // (single-network volume is small). Unscoped → only days past the aggregates.
+  let liveQuery = supabaseAdmin
     .from('speed_results')
     .select('timestamp_utc, download_mbps, upload_mbps')
     .gte('timestamp_utc', liveSinceDate + 'T00:00:00Z')
-    // DESCENDING so that if the live window ever exceeds the cap, truncation
-    // drops the OLDEST live dates (nearest the aggregate boundary) and keeps the
-    // newest — the chart never re-blanks at "today". Output is re-sorted by date
-    // below, so fetch order doesn't change the rendered series.
+    // DESCENDING so truncation drops the OLDEST live dates, never "today".
     .order('timestamp_utc', { ascending: false })
     .limit(5000)
+  if (scoped) liveQuery = liveQuery.eq('ssid', ssid)
+  const { data: raw } = await liveQuery
 
   for (const row of raw ?? []) {
     if (row.timestamp_utc == null) continue
@@ -82,14 +90,16 @@ async function getTrendsData(days: number) {
     }))
 }
 
-async function getTimeOfDayData(days: number) {
+async function getTimeOfDayData(days: number, ssid: string) {
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString()
 
-  const { data } = await supabaseAdmin
+  let query = supabaseAdmin
     .from('speed_results')
     .select('timestamp_utc, download_mbps')
     .gte('timestamp_utc', since)
     .not('download_mbps', 'is', null)
+  if (isScoped(ssid)) query = query.eq('ssid', ssid)
+  const { data } = await query
 
   const rows = data ?? []
 
@@ -163,15 +173,17 @@ async function getWifiStats(days: number) {
   return { bandDistribution, topSsids }
 }
 
-async function getVpnStats(days: number) {
+async function getVpnStats(days: number, ssid: string) {
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString()
 
-  const { data } = await supabaseAdmin
+  let query = supabaseAdmin
     .from('speed_results')
     .select('device_id, vpn_status, download_mbps, upload_mbps')
     .gte('timestamp_utc', since)
     .order('timestamp_utc', { ascending: false })
     .limit(2000)
+  if (isScoped(ssid)) query = query.eq('ssid', ssid)
+  const { data } = await query
 
   const rows = data ?? []
 
@@ -249,20 +261,28 @@ export default async function TrendsPage({
   const params = await searchParams
   const rawDays = parseInt(params.days ?? '30', 10)
   const days = VALID_DAYS.includes(rawDays) ? rawDays : 30
+  const ssid = await resolveSsid(params.ssid)
+  const scopeLabel = ssid === ALL_SSIDS ? 'all networks' : ssid
 
-  const [trendsData, timeOfDayData, wifiStats, vpnStats] = await Promise.all([
-    getTrendsData(days),
-    getTimeOfDayData(days),
+  const [trendsData, timeOfDayData, wifiStats, vpnStats, ssidOptions] = await Promise.all([
+    getTrendsData(days, ssid),
+    getTimeOfDayData(days, ssid),
     getWifiStats(days),
-    getVpnStats(days),
+    getVpnStats(days, ssid),
+    getAvailableSsids(),
   ])
 
   return (
     <div className="p-8">
       {/* Page header */}
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold text-gray-900">Trends</h1>
-        <p className="text-sm text-gray-500 mt-1">Fleet-wide speed patterns and analytics</p>
+      <div className="mb-6 flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Trends</h1>
+          <p className="text-sm text-gray-500 mt-1">
+            Fleet-wide speed patterns · <span className="font-medium text-gray-700">{scopeLabel}</span>
+          </p>
+        </div>
+        <SsidFilter current={ssid} options={ssidOptions} />
       </div>
 
       {/* Day range selector — toggle button group matching DeviceSpeedChart pattern */}
@@ -270,7 +290,7 @@ export default async function TrendsPage({
         {VALID_DAYS.map((d) => (
           <Link
             key={d}
-            href={`?days=${d}`}
+            href={`?days=${d}&ssid=${encodeURIComponent(ssid)}`}
             className={`px-3 py-1.5 text-sm font-medium transition-colors ${
               d === days
                 ? 'bg-indigo-600 text-white'

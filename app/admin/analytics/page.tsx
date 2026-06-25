@@ -1,20 +1,25 @@
 import { supabaseAdmin } from '@/lib/supabase/admin'
+import { isScoped, ALL_SSIDS } from '@/lib/admin/ssid'
+import { resolveSsid, getAvailableSsids } from '@/lib/admin/ssid-server'
 import { VpnImpactRow, SsidRow, DowRow } from '@/lib/analytics/types'
 import VpnImpactTable from '@/components/admin/VpnImpactTable'
 import SsidBarChart from '@/components/admin/SsidBarChart'
 import DowBarChart from '@/components/admin/DowBarChart'
+import SsidFilter from '@/components/admin/SsidFilter'
 
 export const dynamic = 'force-dynamic'
 
-async function getVpnImpactData(): Promise<VpnImpactRow[]> {
+async function getVpnImpactData(ssid: string): Promise<VpnImpactRow[]> {
   const since30d = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString()
 
-  const { data } = await supabaseAdmin
+  let query = supabaseAdmin
     .from('speed_results')
     .select('device_id, hostname, vpn_status, download_mbps, upload_mbps, latency_ms')
     .gte('timestamp_utc', since30d)
     .not('vpn_status', 'is', null)
     .limit(50000)
+  if (isScoped(ssid)) query = query.eq('ssid', ssid)
+  const { data } = await query
 
   const rows = data ?? []
 
@@ -150,15 +155,17 @@ async function getSsidData(): Promise<SsidRow[]> {
   return result
 }
 
-async function getDowData(): Promise<DowRow[]> {
+async function getDowData(ssid: string): Promise<DowRow[]> {
   const since30d = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString()
 
-  const { data } = await supabaseAdmin
+  let query = supabaseAdmin
     .from('speed_results')
     .select('timestamp_utc, download_mbps')
     .gte('timestamp_utc', since30d)
     .not('download_mbps', 'is', null)
     .limit(50000)
+  if (isScoped(ssid)) query = query.eq('ssid', ssid)
+  const { data } = await query
 
   const rows = data ?? []
 
@@ -186,19 +193,32 @@ async function getDowData(): Promise<DowRow[]> {
   }))
 }
 
-export default async function AnalyticsPage() {
-  const [vpnImpact, ssidRows, dowRows] = await Promise.all([
-    getVpnImpactData(),
-    getSsidData(),
-    getDowData(),
+export default async function AnalyticsPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ ssid?: string }>
+}) {
+  const ssid = await resolveSsid((await searchParams).ssid)
+  const scopeLabel = ssid === ALL_SSIDS ? 'all networks' : ssid
+
+  const [vpnImpact, ssidRows, dowRows, ssidOptions] = await Promise.all([
+    getVpnImpactData(ssid),
+    getSsidData(), // cross-network by design (it IS the SSID comparison)
+    getDowData(ssid),
+    getAvailableSsids(),
   ])
 
   return (
     <div className="p-8">
       {/* Page header */}
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold text-gray-900">Analytics</h1>
-        <p className="text-sm text-gray-500 mt-1">80/20 network insights from the last 30 days</p>
+      <div className="mb-6 flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Analytics</h1>
+          <p className="text-sm text-gray-500 mt-1">
+            80/20 network insights · last 30 days · <span className="font-medium text-gray-700">{scopeLabel}</span>
+          </p>
+        </div>
+        <SsidFilter current={ssid} options={ssidOptions} />
       </div>
 
       {/* VPN Impact section */}
