@@ -9,7 +9,7 @@
 # v2.1.0: Added WiFi debugging metrics (MCS, error rates, BSSID tracking)
 #
 
-APP_VERSION="4.1.2"
+APP_VERSION="4.1.3"
 
 # Configuration
 DATA_DIR="$HOME/.local/share/nkspeedtest"
@@ -540,22 +540,19 @@ detect_vpn() {
 # Zscaler IP ranges (CIDR notation)
 # These are the IP ranges that Zscaler uses for egress traffic
 ZSCALER_IP_RANGES=(
-    "136.226.244.0/23"
-    "167.103.88.0/23"
-    "136.226.242.0/23"
-    "136.226.252.0/23"
-    "167.103.6.0/23"
-    "167.103.54.0/23"
-    "165.225.122.0/23"
-    "167.103.70.0/23"
-    "167.103.72.0/23"
-    "167.103.74.0/23"
-    "167.103.76.0/23"
-    "167.103.78.0/23"
-    "167.103.204.0/23"
-    "167.103.206.0/23"
-    "167.103.208.0/23"
-    "167.103.210.0/23"
+    # Authoritative Zscaler egress blocks (parent ranges covering the per-DC /23s).
+    # The earlier hardcoded 16× /23 list was INCOMPLETE and mislabeled real Zscaler
+    # egresses (e.g. 167.103.62.x, 136.226.234.x, 167.103.186.x) as "disconnected".
+    # These /16-level blocks match config.zscaler.com CENR for HV's clouds. Ops can
+    # still override/extend via $ZSCALER_RANGES_FILE (loaded below).
+    "167.103.0.0/16"
+    "136.226.0.0/16"
+    "165.225.0.0/16"
+    "104.129.192.0/20"
+    "147.161.128.0/17"
+    "170.85.0.0/16"
+    "185.46.212.0/22"
+    "199.168.148.0/22"
 )
 
 # Append custom Zscaler ranges from config (if present) — CLIENT-07
@@ -1133,12 +1130,19 @@ collect_metrics() {
     # - If public IP is NOT a Zscaler IP → Zscaler VPN is disconnected
     # This overrides process-based detection because what matters is
     # whether traffic is actually going through Zscaler DC
-    if is_zscaler_ip "$PUBLIC_IP"; then
+    if [[ "$PUBLIC_IP" == "unknown" || -z "$PUBLIC_IP" ]]; then
+        # Public-IP lookup FAILED — we cannot infer egress. Do NOT assert
+        # "disconnected" (that mislabels always-on Zscaler as off, a known
+        # data-quality bug). Mark unknown so the dashboard can exclude it.
+        VPN_STATUS="unknown"
+        [[ -z "$VPN_NAME" || "$VPN_NAME" == "none" ]] && VPN_NAME="unknown"
+        log "Public IP unresolved — vpn_status=unknown (not asserting disconnected)"
+    elif is_zscaler_ip "$PUBLIC_IP"; then
         VPN_STATUS="connected"
         VPN_NAME="Zscaler"
         log "Zscaler detected via public IP: $PUBLIC_IP"
     elif [[ "$VPN_NAME" == "Zscaler" ]]; then
-        # Process said Zscaler, but IP says no - trust the IP
+        # Process said Zscaler, but IP is a real non-Zscaler egress - trust the IP
         VPN_STATUS="disconnected"
         VPN_NAME="none"
         log "Zscaler process running but traffic not via Zscaler DC (IP: $PUBLIC_IP)"
@@ -1227,8 +1231,15 @@ collect_metrics() {
 
         # Latency — ICMP ping to the test server (bypasses curl/proxy issues)
         log "Strategy 1: pinging ${_cf_host} for latency..."
-        local _raw_ping
-        _raw_ping=$(ping -c 8 -q "$_cf_host" 2>/dev/null | tail -1)
+        local _raw_ping _ping_full
+        _ping_full=$(ping -c 8 -q "$_cf_host" 2>/dev/null)
+        _raw_ping=$(echo "$_ping_full" | tail -1)
+        # Real packet loss from the same probe. Previously packet_loss_pct defaulted
+        # to 0 on the Cloudflare path (it was only measured in the fallback ping),
+        # so every row read 0% loss. Populate it from the actual ping summary.
+        local _loss
+        _loss=$(echo "$_ping_full" | grep -oE '[0-9.]+% packet loss' | grep -oE '^[0-9.]+' | head -1)
+        [[ -n "$_loss" ]] && PACKET_LOSS_PCT="$_loss"
         if echo "$_raw_ping" | grep -q "avg"; then
             # macOS: round-trip min/avg/max/stddev = a/b/c/d ms  (NF=8 on [=/] split)
             # latency = avg (NF-2), jitter = stddev (NF) — NOT min (NF-3) / max (NF-1)
@@ -1243,14 +1254,30 @@ collect_metrics() {
         JITTER_P50=${JITTER_MS}; JITTER_P95=${JITTER_MS}
         log "Latency: ${LATENCY_MS}ms  Jitter: ${JITTER_MS}ms"
 
-        # Download — 4 streams for ~8s; sample $_ifc each second and keep the PEAK
+        # Download — N streams for ~8s; sample $_ifc each second and keep the PEAK
         # 1-second rate. Zscaler throttling is intermittent (the same instant can
         # swing 0.4↔25 Mbps), so the average gets dragged down by dropouts. The
         # peak reflects real achievable throughput, matching what users actually get.
-        log "Strategy 1: measuring download (peak 1s) via ${_ifc}..."
+        #
+        # Stream count matters (RFC 6349): behind Zscaler a single TCP flow is
+        # window/RTT-limited to ~8-13 Mbps, so download scales ~linearly with streams
+        # (measured on-fleet: 2→13, 4→30, 6→55, 8→75 Mbps). 6 streams better reflects
+        # real multi-connection capacity without excessive fleet bandwidth. The metric
+        # stays the netstat interface peak-1s (physical wire bytes) so it can never
+        # exceed the real link — more streams reveal capacity, they cannot inflate it.
+        # Tunable via SPEED_DL_STREAMS.
+        local _dl_streams="${SPEED_DL_STREAMS:-6}"
+        # Endpoint health probe (anti-contamination). A rate-limited or blocked
+        # endpoint (HTTP 429/403/5xx) returns tiny bodies that the byte-counter would
+        # otherwise record as a REAL (low) download — indistinguishable from a genuine
+        # throttle, polluting the dashboard. Capture the HTTP status so we can reject
+        # the measurement instead of recording garbage.
+        local _dl_http
+        _dl_http=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "https://${_cf_host}/__down?bytes=1000000" 2>/dev/null)
+        log "Strategy 1: measuring download (peak 1s, ${_dl_streams} streams) via ${_ifc}... (endpoint http=${_dl_http:-000})"
         local _dl_end _peak_dl _prev _prevt _cur _curt _rate
         _dl_end=$(( $(date +%s) + 8 ))
-        for _i in 1 2 3 4; do
+        for _i in $(seq 1 "$_dl_streams"); do
             ( while [ "$(date +%s)" -lt "$_dl_end" ]; do
                 curl -s -o /dev/null --max-time 9 "https://${_cf_host}/__down?bytes=50000000" 2>/dev/null
               done ) &
@@ -1267,7 +1294,13 @@ collect_metrics() {
         done
         wait
 
-        if awk "BEGIN{exit !($_peak_dl > 0)}"; then
+        if [[ ! "$_dl_http" =~ ^2[0-9][0-9]$ ]]; then
+            # Rate-limited / blocked — the peak is bogus. Do NOT record it as a real
+            # download; leave speedtest_success=false so the speedtest-cli fallback
+            # (different servers) can try. Prevents 429s masquerading as throttling.
+            log "Download endpoint HTTP ${_dl_http:-000} (rate-limited/blocked) — discarding measurement, trying fallbacks"
+            errors="${errors:+$errors;}cf_download_http_${_dl_http:-000}"
+        elif awk "BEGIN{exit !($_peak_dl > 0)}"; then
             DOWNLOAD_MBPS=$_peak_dl
             log "Download: ${DOWNLOAD_MBPS} Mbps (peak 1s, ${_ifc})"
 
@@ -1470,6 +1503,16 @@ collect_metrics() {
             STATUS="failed"
             speedtest_success=false
         fi
+    fi
+
+    # Reject implausible telemetry (CLIENT): a latency or jitter above 5000ms is a
+    # timed-out / failed probe, not real network state. Flag it so it doesn't distort
+    # medians or trigger false escalations. Keep the values but mark status so the
+    # dashboard can exclude the row.
+    if awk "BEGIN{exit !((${LATENCY_MS:-0}+0) > 5000 || (${JITTER_MS:-0}+0) > 5000)}" 2>/dev/null; then
+        log "Implausible latency/jitter (lat=${LATENCY_MS} jit=${JITTER_MS}) — marking test_failed_timeout"
+        STATUS="test_failed_timeout"
+        errors="${errors:+$errors;}implausible_latency_jitter"
     fi
 
     # Set defaults for any missing values
