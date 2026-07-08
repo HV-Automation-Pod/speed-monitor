@@ -168,6 +168,9 @@ function getHeaders(sheet) {
     // indices, including 'synced', never shift → no history re-sync).
     'zcc_running', 'zcc_version', 'tunnel_mode',
     'tunnel_interface', 'default_gateway', 'dns_servers',
+    // v4.1.5 — path / hop measurement
+    'zscaler_dc', 'zscaler_vip', 'gateway_rtt_ms', 'dc_rtt_ms',
+    'hop_count', 'traceroute_path',
   ];
 
   const width = HEADERS.length;
@@ -248,6 +251,13 @@ function buildRow(payload, headers) {
     tunnel_interface:    payload.tunnel_interface  || '',
     default_gateway:     payload.default_gateway   || '',
     dns_servers:         payload.dns_servers       || '',
+    // v4.1.5 — path / hop measurement
+    zscaler_dc:          payload.zscaler_dc        || '',
+    zscaler_vip:         payload.zscaler_vip       || '',
+    gateway_rtt_ms:      payload.gateway_rtt_ms    || 0,
+    dc_rtt_ms:           payload.dc_rtt_ms         || 0,
+    hop_count:           payload.hop_count         || '',
+    traceroute_path:     payload.traceroute_path   || '',
   };
 
   return headers.map(function(h) { return mapped[h] !== undefined ? mapped[h] : ''; });
@@ -268,6 +278,9 @@ function rowToSupabaseRecord(row, headers) {
     // run the ALTER TABLE migration BEFORE deploying this change).
     'zcc_running', 'zcc_version', 'tunnel_mode',
     'tunnel_interface', 'default_gateway', 'dns_servers',
+    // v4.1.5 — path / hop measurement
+    'zscaler_dc', 'zscaler_vip', 'gateway_rtt_ms', 'dc_rtt_ms',
+    'hop_count', 'traceroute_path',
   ];
 
   const record = {};

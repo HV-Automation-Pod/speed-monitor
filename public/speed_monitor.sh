@@ -9,7 +9,7 @@
 # v2.1.0: Added WiFi debugging metrics (MCS, error rates, BSSID tracking)
 #
 
-APP_VERSION="4.1.4"
+APP_VERSION="4.1.5"
 
 # Configuration
 DATA_DIR="$HOME/.local/share/nkspeedtest"
@@ -1013,6 +1013,12 @@ build_json_payload() {
     json+="\"tunnel_interface\":\"$(json_escape "${TUNNEL_INTERFACE:-unknown}")\","
     json+="\"default_gateway\":\"$(json_escape "${DEFAULT_GATEWAY:-unknown}")\","
     json+="\"dns_servers\":\"$(json_escape "${DNS_SERVERS:-unknown}")\","
+    json+="\"zscaler_dc\":\"$(json_escape "${ZSCALER_DC:-unknown}")\","
+    json+="\"zscaler_vip\":\"$(json_escape "${ZSCALER_VIP:-}")\","
+    json+="\"gateway_rtt_ms\":${GATEWAY_RTT_MS:-0},"
+    json+="\"dc_rtt_ms\":${DC_RTT_MS:-0},"
+    json+="\"hop_count\":\"$(json_escape "${HOP_COUNT:-}")\","
+    json+="\"traceroute_path\":\"$(json_escape "${TRACEROUTE_PATH:-}")\","
     json+="\"status\":\"$STATUS\""
     json+="}"
     echo "$json"
@@ -1158,6 +1164,42 @@ collect_metrics() {
         TUNNEL_MODE="ztunnel_1.0_or_proxy"
     fi
     log "ZCC: running=${ZCC_RUNNING} ver=${ZCC_VERSION} mode=${TUNNEL_MODE} iface=${TUNNEL_INTERFACE} gw=${DEFAULT_GATEWAY} dns=${DNS_SERVERS}"
+
+    # ── Path / hop measurement ─────────────────────────────────────────────
+    # #1 Zscaler DC identity + ingress VIP. ip.zscaler.com is reachable only when
+    #    egressing via Zscaler and returns the serving datacenter + proxy VIP.
+    ZSCALER_DC="unknown"; ZSCALER_VIP=""
+    _zjson=$(curl -s --max-time 5 "https://ip.zscaler.com/?json" 2>/dev/null)
+    if [[ "$_zjson" == *datacenter* ]]; then
+        ZSCALER_DC=$(echo "$_zjson" | sed -n 's/.*"datacenter":"\([^"]*\)".*/\1/p')
+        ZSCALER_VIP=$(echo "$_zjson" | sed -n 's/.*"vip":"\([^"]*\)".*/\1/p')
+    fi
+    ZSCALER_DC=${ZSCALER_DC:-unknown}
+
+    # #2 Latency tiers (cheap, every cycle): LAN (device→gateway) vs path-to-Zscaler
+    #    (device→ingress VIP). Low LAN RTT + high VIP RTT localises latency to the
+    #    ISP/Zscaler path rather than the office Wi-Fi.
+    GATEWAY_RTT_MS=0; DC_RTT_MS=0
+    if [[ -n "$DEFAULT_GATEWAY" && "$DEFAULT_GATEWAY" != "unknown" ]]; then
+        _g=$(ping -c 3 -q "$DEFAULT_GATEWAY" 2>/dev/null | awk -F'[=/]' '/avg/{printf "%.1f",$(NF-2)}'); [[ -n "$_g" ]] && GATEWAY_RTT_MS="$_g"
+    fi
+    if [[ -n "$ZSCALER_VIP" ]]; then
+        _d=$(ping -c 3 -q "$ZSCALER_VIP" 2>/dev/null | awk -F'[=/]' '/avg/{printf "%.1f",$(NF-2)}'); [[ -n "$_d" ]] && DC_RTT_MS="$_d"
+    fi
+
+    # #3 Traceroute to the underlay (1.1.1.1) — hop count + per-hop path. Expensive
+    #    (~10-15s) and noisy (filtered hops show as gaps; a slow-to-reply router can
+    #    look like a bottleneck), so run only every 4th test via a persistent counter.
+    HOP_COUNT=""; TRACEROUTE_PATH=""
+    _tc_file="$DATA_DIR/trace_counter"
+    _tc=$(( $(cat "$_tc_file" 2>/dev/null || echo 0) + 1 ))
+    echo "$_tc" > "$_tc_file" 2>/dev/null || true
+    if (( _tc % 4 == 0 )); then
+        _tr=$(traceroute -n -w 1 -q 1 -m 18 1.1.1.1 2>/dev/null | tail -n +2)
+        HOP_COUNT=$(echo "$_tr" | grep -cE '([0-9]{1,3}\.){3}[0-9]{1,3}')
+        TRACEROUTE_PATH=$(echo "$_tr" | awk '{h=$1;ip="";ms="";for(i=2;i<=NF;i++){if($i ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/)ip=$i;if($i=="ms")ms=$(i-1)} if(ip!="")printf "%s@%s(%sms)|",h,ip,ms}' | sed 's/|$//')
+    fi
+    log "Path: dc=${ZSCALER_DC} vip=${ZSCALER_VIP:-none} gw_rtt=${GATEWAY_RTT_MS}ms dc_rtt=${DC_RTT_MS}ms hops=${HOP_COUNT:-skip}"
 
     # VPN detection
     log "Detecting VPN status..."
