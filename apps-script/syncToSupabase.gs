@@ -59,7 +59,16 @@ function syncToSupabase(data) {
     errors:               data.errors,
     client_version:       data.app_version,
     os_version:           data.os_version,
-    user_email:           data.user_email
+    user_email:           data.user_email,
+    // ZCC / tunnel-state (v4.1.4) — requires the matching columns in Supabase
+    // (see the ALTER TABLE migration). Safe to add: unmapped/extra keys were
+    // ignored before; once these columns exist the values flow through.
+    zcc_running:          data.zcc_running,
+    zcc_version:          data.zcc_version,
+    tunnel_mode:          data.tunnel_mode,
+    tunnel_interface:     data.tunnel_interface,
+    default_gateway:      data.default_gateway,
+    dns_servers:          data.dns_servers
   };
 
   var resp = UrlFetchApp.fetch(SUPABASE_URL + '/rest/v1/speed_results', {
