@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SpeedMonitor v4.1.2 — Installer
+# SpeedMonitor Installer (version resolved at runtime from VERSION)
 # Usage: curl -fsSL https://raw.githubusercontent.com/HV-Automation-Pod/speed-monitor/main/public/install.sh | bash
 #
 # What this does:
@@ -13,6 +13,10 @@
 set -euo pipefail
 
 GITHUB_BASE="https://raw.githubusercontent.com/HV-Automation-Pod/speed-monitor/main/public"
+
+# Version being installed — read from the VERSION file so install messages
+# always reflect the real version instead of a hardcoded (drift-prone) string.
+VERSION=$(curl -fsSL --max-time 10 "$GITHUB_BASE/VERSION" 2>/dev/null | tr -d '[:space:]'); VERSION=${VERSION:-latest}
 
 # Accept overrides from env (used by jamf_deploy.sh and CI)
 APPS_SCRIPT_URL="${APPS_SCRIPT_URL:-https://script.google.com/macros/s/AKfycbwVFU_laGOiqaZ7fLUyIYZ8eH55bQs7cxE4BptKhngSvx465r1i7XVitNN6y1Ebx52TaA/exec}"
@@ -56,7 +60,7 @@ APP_DEST="$HOME/Applications/SpeedMonitor.app"
 
 log() { echo "[SpeedMonitor install] $*"; }
 
-log "Starting SpeedMonitor v4.1.2 installation..."
+log "Starting SpeedMonitor v${VERSION} installation..."
 
 # ── 0. Stop previous installation ─────────────────────────────────────────
 log "Stopping previous installation (if any)..."
@@ -196,7 +200,7 @@ launchctl bootstrap "gui/$(id -u)" "$APP_PLIST" 2>/dev/null || \
 log "App LaunchAgent loaded — SpeedMonitor.app starts at login"
 
 echo ""
-echo "SpeedMonitor v4.1.2 installation complete."
+echo "SpeedMonitor v${VERSION} installation complete."
 echo "  • First speed test runs within ~30 seconds"
 echo "  • Tests run every 10 minutes automatically"
 echo "  • Look for the SpeedMonitor icon in your menu bar"
