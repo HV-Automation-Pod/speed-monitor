@@ -1243,14 +1243,23 @@ collect_metrics() {
         JITTER_P50=${JITTER_MS}; JITTER_P95=${JITTER_MS}
         log "Latency: ${LATENCY_MS}ms  Jitter: ${JITTER_MS}ms"
 
-        # Download — 4 streams for ~8s; sample $_ifc each second and keep the PEAK
+        # Download — N streams for ~8s; sample $_ifc each second and keep the PEAK
         # 1-second rate. Zscaler throttling is intermittent (the same instant can
         # swing 0.4↔25 Mbps), so the average gets dragged down by dropouts. The
         # peak reflects real achievable throughput, matching what users actually get.
-        log "Strategy 1: measuring download (peak 1s) via ${_ifc}..."
+        #
+        # Stream count matters (RFC 6349): behind Zscaler a single TCP flow is
+        # window/RTT-limited to ~8-13 Mbps, so download scales ~linearly with streams
+        # (measured on-fleet: 2→13, 4→30, 6→55, 8→75 Mbps). 6 streams better reflects
+        # real multi-connection capacity without excessive fleet bandwidth. The metric
+        # stays the netstat interface peak-1s (physical wire bytes) so it can never
+        # exceed the real link — more streams reveal capacity, they cannot inflate it.
+        # Tunable via SPEED_DL_STREAMS.
+        local _dl_streams="${SPEED_DL_STREAMS:-6}"
+        log "Strategy 1: measuring download (peak 1s, ${_dl_streams} streams) via ${_ifc}..."
         local _dl_end _peak_dl _prev _prevt _cur _curt _rate
         _dl_end=$(( $(date +%s) + 8 ))
-        for _i in 1 2 3 4; do
+        for _i in $(seq 1 "$_dl_streams"); do
             ( while [ "$(date +%s)" -lt "$_dl_end" ]; do
                 curl -s -o /dev/null --max-time 9 "https://${_cf_host}/__down?bytes=50000000" 2>/dev/null
               done ) &
