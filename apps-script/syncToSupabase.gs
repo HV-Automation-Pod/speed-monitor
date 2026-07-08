@@ -171,6 +171,13 @@ function getHeaders(sheet) {
   ];
 
   const width = HEADERS.length;
+
+  // Ensure the sheet grid is wide enough — appendRow-grown sheets may have exactly
+  // the old column count, and getRange beyond the grid throws "out of bounds".
+  if (sheet.getMaxColumns() < width) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), width - sheet.getMaxColumns());
+  }
+
   const current = sheet.getRange(1, 1, 1, width).getValues()[0].map(function(v) { return String(v); });
 
   // Rewrite the header row only if it doesn't already match HEADERS exactly.
