@@ -9,7 +9,7 @@
 # v2.1.0: Added WiFi debugging metrics (MCS, error rates, BSSID tracking)
 #
 
-APP_VERSION="4.1.3"
+APP_VERSION="4.1.4"
 
 # Configuration
 DATA_DIR="$HOME/.local/share/nkspeedtest"
@@ -1007,6 +1007,12 @@ build_json_payload() {
     json+="\"bssid_changed\":$BSSID_CHANGED,"
     json+="\"roam_count\":$ROAM_COUNT,"
     json+="\"errors\":\"$safe_errors\","
+    json+="\"zcc_running\":\"$(json_escape "${ZCC_RUNNING:-unknown}")\","
+    json+="\"zcc_version\":\"$(json_escape "${ZCC_VERSION:-unknown}")\","
+    json+="\"tunnel_mode\":\"$(json_escape "${TUNNEL_MODE:-unknown}")\","
+    json+="\"tunnel_interface\":\"$(json_escape "${TUNNEL_INTERFACE:-unknown}")\","
+    json+="\"default_gateway\":\"$(json_escape "${DEFAULT_GATEWAY:-unknown}")\","
+    json+="\"dns_servers\":\"$(json_escape "${DNS_SERVERS:-unknown}")\","
     json+="\"status\":\"$STATUS\""
     json+="}"
     echo "$json"
@@ -1117,6 +1123,41 @@ collect_metrics() {
     # Network info
     LOCAL_IP=$(get_local_ip)
     PUBLIC_IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "unknown")
+
+    # Resolve redacted SSID from a known local subnet. macOS returns the literal
+    # "WiFi" as the SSID when Location Services isn't granted to SpeedMonitor.app.
+    # The office LAN is a known subnet (10.20.0.0/16), so recover the real network
+    # name for it. Add more subnet→name mappings here as sites are identified.
+    if [[ "$SSID" == "WiFi" || "$SSID" == "unknown" || "$SSID" == "Unknown/Ethernet" || -z "$SSID" ]] && [[ "$LOCAL_IP" == 10.20.* ]]; then
+        SSID="HypervergeHQ"
+        log "SSID resolved from local subnet 10.20.x → HypervergeHQ"
+    fi
+
+    # ── ZCC / tunnel-state capture ──────────────────────────────────────────
+    # Full Zscaler Client Connector + routing/DNS state so the dashboard can
+    # explain WHY a row is (or isn't) tunnelled, instead of only inferring from
+    # the public IP. All best-effort; each field defaults to "unknown".
+    if pgrep -x "Zscaler" >/dev/null 2>&1 || pgrep -x "ZscalerTunnel" >/dev/null 2>&1; then
+        ZCC_RUNNING="yes"
+    else
+        ZCC_RUNNING="no"
+    fi
+    ZCC_VERSION=$(defaults read "/Applications/Zscaler/Zscaler.app/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null \
+        || defaults read "/Applications/Zscaler.app/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null \
+        || echo "unknown")
+    TUNNEL_INTERFACE=$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}'); TUNNEL_INTERFACE=${TUNNEL_INTERFACE:-unknown}
+    DEFAULT_GATEWAY=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}');   DEFAULT_GATEWAY=${DEFAULT_GATEWAY:-unknown}
+    DNS_SERVERS=$(scutil --dns 2>/dev/null | awk '/nameserver\[0\]/{print $3; exit}');         DNS_SERVERS=${DNS_SERVERS:-unknown}
+    # tunnel_mode heuristic: Z-Tunnel 2.0 routes via a utun packet interface;
+    # Z-Tunnel 1.0 is a local proxy so the default route stays on the physical NIC.
+    if [[ "$ZCC_RUNNING" == "no" ]]; then
+        TUNNEL_MODE="no_zcc"
+    elif [[ "$TUNNEL_INTERFACE" == utun* ]]; then
+        TUNNEL_MODE="ztunnel_2.0"
+    else
+        TUNNEL_MODE="ztunnel_1.0_or_proxy"
+    fi
+    log "ZCC: running=${ZCC_RUNNING} ver=${ZCC_VERSION} mode=${TUNNEL_MODE} iface=${TUNNEL_INTERFACE} gw=${DEFAULT_GATEWAY} dns=${DNS_SERVERS}"
 
     # VPN detection
     log "Detecting VPN status..."
