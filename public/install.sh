@@ -47,6 +47,7 @@ if [[ "$(id -u)" == "0" ]]; then
     exec launchctl asuser "$USER_UID" sudo -u "$CONSOLE_USER" \
         HOME="/Users/$CONSOLE_USER" USER="$CONSOLE_USER" \
         APPS_SCRIPT_URL="$APPS_SCRIPT_URL" INGEST_TOKEN="$INGEST_TOKEN" \
+        SPEED_DL_URL="${SPEED_DL_URL:-}" SPEED_UL_URL="${SPEED_UL_URL:-}" SPEED_JITTER_SEC="${SPEED_JITTER_SEC:-}" \
         /bin/bash "$TMP"
 fi
 
