@@ -2,6 +2,9 @@
 #
 # Speed Monitor v3.0.0 - Organization-Wide Internet Speed Monitoring
 # Enhanced data collection for fleet deployment (300+ devices)
+# v4.1.6: Download/upload = SUSTAINED bytes/window (not peak-of-1s). Fixes the metric
+#         that inflated highs above the WAN rate and logged failed transfers as low
+#         "success" (the bimodal 0.45-5 vs 280-736 Mbps artifact). See _throughput_mbps.
 # v3.0.0: Unified versioning, self-update mechanism
 # v2.4.0: Added curl timeout to prevent process hangs
 # v2.3.0: Bug fixes - jitter percentiles, TCP retransmits delta, JSON escaping, status field
@@ -9,7 +12,7 @@
 # v2.1.0: Added WiFi debugging metrics (MCS, error rates, BSSID tracking)
 #
 
-APP_VERSION="4.1.5"
+APP_VERSION="4.1.6"
 
 # Configuration
 DATA_DIR="$HOME/.local/share/nkspeedtest"
@@ -947,6 +950,40 @@ is_positive_number() {
     awk "BEGIN { exit !($val >= 0) }" 2>/dev/null
 }
 
+# >>>THROUGHPUT_HELPER_START (self-contained; unit-tested by tests/test_throughput.sh)
+# Sustained throughput in Mbps from total interface bytes over the FULL window.
+# This REPLACES the old "peak of the best 1-second sample" statistic, which was a
+# max() over noisy local-NIC byte-counter deltas. That statistic (a) inflated highs
+# above the real WAN rate when an upstream buffer drained in a sub-second burst, and
+# (b) could not distinguish a genuinely slow link from a failed/aborted transfer, so
+# timed-out/reset streams were logged as a low "success" — the source of the bimodal
+# 0.45-5 vs 280-736 Mbps distribution. bytes/full-window cannot exceed the physical
+# delivery rate. Validity gates reject aborted transfers (too few bytes, or too few
+# "live" seconds) instead of recording a misleading low value; a sanity cap guards
+# against netstat counter wrap. Args are non-negative integers.
+#
+# _throughput_mbps <bytes_delta> <ms_delta> <min_bytes> <min_ms> <max_mbps>
+#   echoes Mbps (2 dp) on success, or the literal "INVALID" for a failed/near-zero test.
+# We measure two points (bytes/time at window start and end) rather than per-second
+# samples: on macOS, per-second netstat sampling is starved under multi-stream CPU load
+# (each netstat/awk/python spawn lags), so a sampled "active seconds" signal is
+# unreliable. bytes/full-window is robust and inherently inflation-proof; the byte floor
+# rejects near-zero/failed transfers and the caller's HTTP-status probe rejects a
+# rate-limited endpoint. A partial transfer just yields its honest effective average.
+_throughput_mbps() {
+    local _db="$1" _dt="$2" _minb="$3" _minms="$4" _max="$5"
+    [[ "$_db" =~ ^[0-9]+$ ]]   || { echo "INVALID"; return 1; }
+    [[ "$_dt" =~ ^[0-9]+$ ]]   || { echo "INVALID"; return 1; }
+    [[ "$_dt" -ge "$_minms" ]] || { echo "INVALID"; return 1; }
+    [[ "$_db" -ge "$_minb" ]]  || { echo "INVALID"; return 1; }
+    awk -v db="$_db" -v dt="$_dt" -v mx="$_max" 'BEGIN{
+        r = (db * 8) / (1000 * dt);   # (db*8 bits)/1e6 / (dt ms / 1000 s) = db*8/(1000*dt) Mbps
+        if (r > mx) r = mx;
+        printf "%.2f", r;
+    }'
+}
+# >>>THROUGHPUT_HELPER_END
+
 # Escape string for JSON (handle quotes, backslashes, newlines)
 json_escape() {
     local str="$1"
@@ -1337,91 +1374,99 @@ collect_metrics() {
         JITTER_P50=${JITTER_MS}; JITTER_P95=${JITTER_MS}
         log "Latency: ${LATENCY_MS}ms  Jitter: ${JITTER_MS}ms"
 
-        # Download — N streams for ~8s; sample $_ifc each second and keep the PEAK
-        # 1-second rate. Zscaler throttling is intermittent (the same instant can
-        # swing 0.4↔25 Mbps), so the average gets dragged down by dropouts. The
-        # peak reflects real achievable throughput, matching what users actually get.
+        # Download — launch $_dl_streams parallel streams for the window and measure
+        # the SUSTAINED rate as total interface bytes over the full wall-clock window
+        # (two-point bytes/window, via _throughput_mbps), NOT the peak 1-second sample.
         #
-        # Stream count matters (RFC 6349): behind Zscaler a single TCP flow is
-        # window/RTT-limited to ~8-13 Mbps, so download scales ~linearly with streams
-        # (measured on-fleet: 2→13, 4→30, 6→55, 8→75 Mbps). 6 streams better reflects
-        # real multi-connection capacity without excessive fleet bandwidth. The metric
-        # stays the netstat interface peak-1s (physical wire bytes) so it can never
-        # exceed the real link — more streams reveal capacity, they cannot inflate it.
-        # Tunable via SPEED_DL_STREAMS.
+        # WHY (R1 fix, 2026-07-09): the old "peak of the best 1-second netstat bucket"
+        # was a max() over noisy local-NIC samples. It (a) inflated highs above the real
+        # WAN rate when an upstream buffer drained in a sub-second burst (a burst can
+        # cross the fast Wi-Fi NIC well above the WAN's sustained rate — measured live:
+        # peak read 199.7 Mbps while true sustained was 20.3), and (b) could not tell a
+        # slow link from a failed transfer, so timed-out/reset streams were logged as a
+        # low "success" — the source of the bimodal 0.45-5 vs 280-736 Mbps artifact.
+        # bytes/full-window can never exceed the physical delivery rate. We read the
+        # counter only at the start and end of the window (per-second sampling is starved
+        # under multi-stream CPU load on macOS, so a sampled liveness signal is
+        # unreliable), gate on total bytes + elapsed time, and KILL the workers at the
+        # window edge so a long tail can't skew the window. Multi-stream (RFC 6349)
+        # reveals real capacity; it cannot inflate bytes/window. Tunables:
+        # SPEED_DL_STREAMS, SPEED_DL_WINDOW, SPEED_DL_MIN_BYTES, SPEED_DL_MIN_MS, SPEED_MAX_MBPS.
         local _dl_streams="${SPEED_DL_STREAMS:-6}"
-        # Endpoint health probe (anti-contamination). A rate-limited or blocked
-        # endpoint (HTTP 429/403/5xx) returns tiny bodies that the byte-counter would
-        # otherwise record as a REAL (low) download — indistinguishable from a genuine
-        # throttle, polluting the dashboard. Capture the HTTP status so we can reject
-        # the measurement instead of recording garbage.
+        local _dl_window="${SPEED_DL_WINDOW:-8}"
+        local _dl_min_bytes="${SPEED_DL_MIN_BYTES:-250000}"   # <0.25 MB in the window => failed/near-zero, not a reading
+        local _dl_min_ms="${SPEED_DL_MIN_MS:-4000}"           # the window must actually have elapsed
+        local _max_mbps="${SPEED_MAX_MBPS:-2000}"             # sanity cap (2 Gbps): guards netstat counter wrap
+        # Endpoint health probe (anti-contamination): a rate-limited/blocked endpoint
+        # (HTTP 429/403/5xx) returns tiny bodies that would look like a real low download.
         local _dl_http
         _dl_http=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "https://${_cf_host}/__down?bytes=1000000" 2>/dev/null)
-        log "Strategy 1: measuring download (peak 1s, ${_dl_streams} streams) via ${_ifc}... (endpoint http=${_dl_http:-000})"
-        local _dl_end _peak_dl _prev _prevt _cur _curt _rate
-        _dl_end=$(( $(date +%s) + 8 ))
+        log "Strategy 1: measuring download (bytes/window, ${_dl_streams} streams, ${_dl_window}s) via ${_ifc}... (endpoint http=${_dl_http:-000})"
+        local _dl_end _b0 _t0 _b1 _t1 _db _dt _dl_result
+        local _dl_pids=()
+        _dl_end=$(( $(date +%s) + _dl_window ))
         for _i in $(seq 1 "$_dl_streams"); do
             ( while [ "$(date +%s)" -lt "$_dl_end" ]; do
-                curl -s -o /dev/null --max-time 9 "https://${_cf_host}/__down?bytes=50000000" 2>/dev/null
+                curl -s -o /dev/null --max-time "$_dl_window" "https://${_cf_host}/__down?bytes=50000000" 2>/dev/null
               done ) &
+            _dl_pids+=("$!")
         done
-        _peak_dl=0; _prev=$(_if_ibytes); _prevt=$(_epoch_ms)
-        while [ "$(date +%s)" -lt "$_dl_end" ]; do
-            sleep 1
-            _cur=$(_if_ibytes); _curt=$(_epoch_ms)
-            if is_positive_number "$_cur" && [[ "$_cur" -gt "$_prev" ]] && [[ "$_curt" -gt "$_prevt" ]]; then
-                _rate=$(awk "BEGIN{printf \"%.2f\", ($_cur-$_prev)*8/($_curt-$_prevt)/1000}")
-                awk "BEGIN{exit !($_rate > $_peak_dl)}" && _peak_dl=$_rate
-            fi
-            _prev=$_cur; _prevt=$_curt
-        done
-        wait
+        _b0=$(_if_ibytes); _t0=$(_epoch_ms)
+        while [ "$(date +%s)" -lt "$_dl_end" ]; do sleep 1; done
+        _b1=$(_if_ibytes); _t1=$(_epoch_ms)
+        kill "${_dl_pids[@]}" 2>/dev/null; pkill -f 'cloudflare.com/__down' 2>/dev/null; wait 2>/dev/null
+        _db=0; _dt=0
+        [[ "$_b0" =~ ^[0-9]+$ ]] && [[ "$_b1" =~ ^[0-9]+$ ]] && [[ "$_b1" -ge "$_b0" ]] && _db=$(( _b1 - _b0 ))
+        [[ "$_t0" =~ ^[0-9]+$ ]] && [[ "$_t1" =~ ^[0-9]+$ ]] && [[ "$_t1" -gt "$_t0" ]] && _dt=$(( _t1 - _t0 ))
+        _dl_result=$(_throughput_mbps "$_db" "$_dt" "$_dl_min_bytes" "$_dl_min_ms" "$_max_mbps")
 
         if [[ ! "$_dl_http" =~ ^2[0-9][0-9]$ ]]; then
-            # Rate-limited / blocked — the peak is bogus. Do NOT record it as a real
-            # download; leave speedtest_success=false so the speedtest-cli fallback
-            # (different servers) can try. Prevents 429s masquerading as throttling.
+            # Rate-limited / blocked endpoint — do NOT record; let the fallbacks try.
             log "Download endpoint HTTP ${_dl_http:-000} (rate-limited/blocked) — discarding measurement, trying fallbacks"
             errors="${errors:+$errors;}cf_download_http_${_dl_http:-000}"
-        elif awk "BEGIN{exit !($_peak_dl > 0)}"; then
-            DOWNLOAD_MBPS=$_peak_dl
-            log "Download: ${DOWNLOAD_MBPS} Mbps (peak 1s, ${_ifc})"
+        elif [[ "$_dl_result" == "INVALID" ]]; then
+            # Near-zero / failed transfer (below the byte floor, or window did not run).
+            # Do NOT record a low download — that is the bug being fixed. Leave
+            # speedtest_success=false so the speedtest-cli fallback can try.
+            log "Download invalid: ${_db}B / ${_dt}ms (below floor) — discarding, trying fallbacks"
+            errors="${errors:+$errors;}cf_download_aborted"
+        else
+            DOWNLOAD_MBPS=$_dl_result
+            log "Download: ${DOWNLOAD_MBPS} Mbps (bytes/window: ${_db}B over ${_dt}ms, ${_ifc})"
 
-            # Upload — same peak-sampling approach
-            log "Strategy 1: measuring upload (peak 1s) via ${_ifc}..."
-            local _ul_end _peak_ul
-            _ul_end=$(( $(date +%s) + 8 ))
-            for _i in 1 2 3 4; do
+            # Upload — same two-point bytes/window method.
+            log "Strategy 1: measuring upload (bytes/window) via ${_ifc}..."
+            local _ul_streams="${SPEED_UL_STREAMS:-4}"
+            local _ul_window="${SPEED_UL_WINDOW:-8}"
+            local _ul_end _ub0 _ut0 _ub1 _ut1 _udb _udt _ul_result
+            local _ul_pids=()
+            _ul_end=$(( $(date +%s) + _ul_window ))
+            for _i in $(seq 1 "$_ul_streams"); do
                 ( while [ "$(date +%s)" -lt "$_ul_end" ]; do
                     dd if=/dev/zero bs=1048576 count=50 2>/dev/null | \
-                    curl -s -o /dev/null --max-time 9 -X POST --data-binary @- "https://${_cf_host}/__up" 2>/dev/null
+                    curl -s -o /dev/null --max-time "$_ul_window" -X POST --data-binary @- "https://${_cf_host}/__up" 2>/dev/null
                   done ) &
+                _ul_pids+=("$!")
             done
-            _peak_ul=0; _prev=$(_if_obytes); _prevt=$(_epoch_ms)
-            while [ "$(date +%s)" -lt "$_ul_end" ]; do
-                sleep 1
-                _cur=$(_if_obytes); _curt=$(_epoch_ms)
-                if is_positive_number "$_cur" && [[ "$_cur" -gt "$_prev" ]] && [[ "$_curt" -gt "$_prevt" ]]; then
-                    _rate=$(awk "BEGIN{printf \"%.2f\", ($_cur-$_prev)*8/($_curt-$_prevt)/1000}")
-                    awk "BEGIN{exit !($_rate > $_peak_ul)}" && _peak_ul=$_rate
-                fi
-                _prev=$_cur; _prevt=$_curt
-            done
-            wait
-
-            if awk "BEGIN{exit !($_peak_ul > 0)}"; then
-                UPLOAD_MBPS=$_peak_ul
-                log "Upload: ${UPLOAD_MBPS} Mbps (peak 1s, ${_ifc})"
-            else
+            _ub0=$(_if_obytes); _ut0=$(_epoch_ms)
+            while [ "$(date +%s)" -lt "$_ul_end" ]; do sleep 1; done
+            _ub1=$(_if_obytes); _ut1=$(_epoch_ms)
+            kill "${_ul_pids[@]}" 2>/dev/null; pkill -f 'cloudflare.com/__up' 2>/dev/null; wait 2>/dev/null
+            _udb=0; _udt=0
+            [[ "$_ub0" =~ ^[0-9]+$ ]] && [[ "$_ub1" =~ ^[0-9]+$ ]] && [[ "$_ub1" -ge "$_ub0" ]] && _udb=$(( _ub1 - _ub0 ))
+            [[ "$_ut0" =~ ^[0-9]+$ ]] && [[ "$_ut1" =~ ^[0-9]+$ ]] && [[ "$_ut1" -gt "$_ut0" ]] && _udt=$(( _ut1 - _ut0 ))
+            _ul_result=$(_throughput_mbps "$_udb" "$_udt" "$_dl_min_bytes" "$_dl_min_ms" "$_max_mbps")
+            if [[ "$_ul_result" == "INVALID" ]]; then
                 UPLOAD_MBPS="0"
-                log "Upload measurement failed (no byte delta on ${_ifc})"
+                log "Upload measurement failed/near-zero: ${_udb}B / ${_udt}ms"
+            else
+                UPLOAD_MBPS=$_ul_result
+                log "Upload: ${UPLOAD_MBPS} Mbps (bytes/window, ${_ifc})"
             fi
 
             STATUS="success_cloudflare"
             speedtest_success=true
-            log "Strategy 1 succeeded (Cloudflare peak-1s) - Down: ${DOWNLOAD_MBPS} Mbps, Up: ${UPLOAD_MBPS} Mbps, Latency: ${LATENCY_MS}ms"
-        else
-            log "Strategy 1 failed: no download byte delta on ${_ifc}"
+            log "Strategy 1 succeeded (Cloudflare bytes/window) - Down: ${DOWNLOAD_MBPS} Mbps, Up: ${UPLOAD_MBPS} Mbps, Latency: ${LATENCY_MS}ms"
         fi
     fi
 
