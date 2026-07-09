@@ -115,6 +115,11 @@ chmod 600 "$CONFIG_DIR/ingest_token"
 # Dashboard server URL — overwrite any stale value (e.g. old Vercel URL)
 printf '%s' "$SERVER_URL" > "$CONFIG_DIR/server_url"
 
+# Throughput test origin (must NOT be behind a CDN — own S3 object or VM — so the shared
+# Zscaler egress isn't 429-rate-limited by Cloudflare). Baked in when provided via env.
+[[ -n "${SPEED_DL_URL:-}" ]] && { printf '%s' "$SPEED_DL_URL" > "$CONFIG_DIR/dl_url"; log "download origin set: $SPEED_DL_URL"; }
+[[ -n "${SPEED_UL_URL:-}" ]] && { printf '%s' "$SPEED_UL_URL" > "$CONFIG_DIR/ul_url"; log "upload origin set: $SPEED_UL_URL"; }
+
 log "Apps Script endpoint configured"
 
 # Reuse existing device_id on reinstall (keeps same device in dashboard)

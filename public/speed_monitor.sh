@@ -2,6 +2,11 @@
 #
 # Speed Monitor v3.0.0 - Organization-Wide Internet Speed Monitoring
 # Enhanced data collection for fleet deployment (300+ devices)
+# v4.1.8: Trustworthy throughput. (1) Configurable test origin — SPEED_DL_URL/SPEED_UL_URL
+#         point at an origin NOT fronted by a CDN (own S3 object / VM), so the shared
+#         Zscaler egress isn't 429-rate-limited by Cloudflare (falls back with a warning).
+#         (2) Jitter: scheduled runs sleep 0..SPEED_JITTER_SEC so devices sharing egress
+#         IPs don't burst the origin together. Until an origin is set, download is noise.
 # v4.1.7: Corporate-egress accuracy. (1) Detect Cloudflare 429 on the REAL transfer
 #         (1 MB health probe misses it) → log status=rate_limited_429 instead of a wrong
 #         low number, and fall back to Ookla. (2) Round-robin scheduling: each device
@@ -18,7 +23,7 @@
 # v2.1.0: Added WiFi debugging metrics (MCS, error rates, BSSID tracking)
 #
 
-APP_VERSION="4.1.7"
+APP_VERSION="4.1.8"
 
 # Configuration
 DATA_DIR="$HOME/.local/share/nkspeedtest"
@@ -1188,6 +1193,16 @@ collect_metrics() {
             return 0
         fi
         log "Round-robin: this device's slot (my=$_my_slot of $_nslots, cur=$_cur_slot, age=${_age}s) — running"
+
+        # Jitter: even in-slot, devices behind the same few egress IPs would otherwise
+        # fire together at the launchd interval and burst the origin. Sleep a random
+        # 0..SPEED_JITTER_SEC (default 180s, within the 5-min slot) to spread them out.
+        local _jit="${SPEED_JITTER_SEC:-180}"
+        if [[ "$_jit" =~ ^[0-9]+$ ]] && [[ "$_jit" -gt 0 ]]; then
+            local _j=$(( RANDOM % (_jit + 1) ))
+            log "Jitter: sleeping ${_j}s before test"
+            sleep "$_j"
+        fi
     fi
 
     OS_VERSION=$(sw_vers -productVersion 2>/dev/null || echo "unknown")
@@ -1404,7 +1419,25 @@ collect_metrics() {
     # local proxy buffer). Counting actual bytes on the wire over a sustained
     # 4-stream transfer matches Ookla closely (validated against Ookla Chennai).
     if [[ "$speedtest_success" == "false" && "$_use_ookla" != "1" ]]; then
-        local _cf_host="speed.cloudflare.com"
+        # Test origin. Cloudflare rate-limits (HTTP 429) the shared corporate/Zscaler
+        # egress IP, so throughput measured against it is meaningless from the office.
+        # Point SPEED_DL_URL / SPEED_UL_URL at an origin that NOTHING fronts — your own
+        # S3 object or a small VM, NOT CloudFront/Fastly/Cloudflare. Falls back to
+        # Cloudflare with a loud warning if unset. SPEED_UL_METHOD defaults to POST
+        # (use PUT for a presigned S3 upload). URLs may also come from config files.
+        local _dl_url="${SPEED_DL_URL:-}" _ul_url="${SPEED_UL_URL:-}"
+        [[ -z "$_dl_url" && -f "$CONFIG_DIR/dl_url" ]] && _dl_url="$(tr -d '[:space:]' < "$CONFIG_DIR/dl_url" 2>/dev/null)"
+        [[ -z "$_ul_url" && -f "$CONFIG_DIR/ul_url" ]] && _ul_url="$(tr -d '[:space:]' < "$CONFIG_DIR/ul_url" 2>/dev/null)"
+        local _ul_method="${SPEED_UL_METHOD:-POST}"
+        if [[ -z "$_dl_url" ]]; then
+            _dl_url="https://speed.cloudflare.com/__down?bytes=50000000"
+            log "WARN: SPEED_DL_URL not set — using Cloudflare, which 429-rate-limits the shared egress; download numbers will be UNRELIABLE. Set a non-CDN origin."
+        fi
+        [[ -z "$_ul_url" ]] && _ul_url="https://speed.cloudflare.com/__up"
+        # Host to ping for latency (derived from the download origin).
+        local _cf_host
+        _cf_host="$(printf '%s' "$_dl_url" | sed -E 's#^[a-z]+://([^/]+).*#\1#')"
+        [[ -z "$_cf_host" ]] && _cf_host="speed.cloudflare.com"
 
         # Active interface (default route); fall back to en0
         local _ifc
@@ -1467,21 +1500,21 @@ collect_metrics() {
         # Endpoint health probe (anti-contamination): a rate-limited/blocked endpoint
         # (HTTP 429/403/5xx) returns tiny bodies that would look like a real low download.
         local _dl_http
-        _dl_http=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "https://${_cf_host}/__down?bytes=1000000" 2>/dev/null)
+        _dl_http=$(curl -s -o /dev/null -w '%{http_code}' -r 0-1048575 --max-time 8 "$_dl_url" 2>/dev/null)
         log "Strategy 1: measuring download (bytes/window, ${_dl_streams} streams, ${_dl_window}s) via ${_ifc}... (endpoint http=${_dl_http:-000})"
         local _dl_end _b0 _t0 _b1 _t1 _db _dt _dl_result
         local _dl_pids=()
         _dl_end=$(( $(date +%s) + _dl_window ))
         for _i in $(seq 1 "$_dl_streams"); do
             ( while [ "$(date +%s)" -lt "$_dl_end" ]; do
-                curl -s -o /dev/null --max-time "$_dl_window" "https://${_cf_host}/__down?bytes=50000000" 2>/dev/null
+                curl -s -o /dev/null --max-time "$_dl_window" "$_dl_url" 2>/dev/null
               done ) &
             _dl_pids+=("$!")
         done
         _b0=$(_if_ibytes); _t0=$(_epoch_ms)
         while [ "$(date +%s)" -lt "$_dl_end" ]; do sleep 1; done
         _b1=$(_if_ibytes); _t1=$(_epoch_ms)
-        kill "${_dl_pids[@]}" 2>/dev/null; pkill -f 'cloudflare.com/__down' 2>/dev/null; wait 2>/dev/null
+        kill "${_dl_pids[@]}" 2>/dev/null; pkill -f "$_cf_host" 2>/dev/null; wait 2>/dev/null
         _db=0; _dt=0
         [[ "$_b0" =~ ^[0-9]+$ ]] && [[ "$_b1" =~ ^[0-9]+$ ]] && [[ "$_b1" -ge "$_b0" ]] && _db=$(( _b1 - _b0 ))
         [[ "$_t0" =~ ^[0-9]+$ ]] && [[ "$_t1" =~ ^[0-9]+$ ]] && [[ "$_t1" -gt "$_t0" ]] && _dt=$(( _t1 - _t0 ))
@@ -1494,7 +1527,7 @@ collect_metrics() {
         # throttling us, not a slow link — and we must not record a bogus low number.
         local _dl_http2=""
         if [[ "$_dl_result" == "INVALID" ]] || awk "BEGIN{exit !((${_dl_result}+0) < ${SPEED_RL_CHECK_MBPS:-50})}" 2>/dev/null; then
-            _dl_http2=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "https://${_cf_host}/__down?bytes=25000000" 2>/dev/null)
+            _dl_http2=$(curl -s -o /dev/null -w '%{http_code}' -r 0-26214399 --max-time 6 "$_dl_url" 2>/dev/null)
             [[ "$_dl_http2" =~ ^(429|403|5[0-9][0-9])$ ]] && CF_RATELIMITED=1
         fi
 
@@ -1525,14 +1558,14 @@ collect_metrics() {
             for _i in $(seq 1 "$_ul_streams"); do
                 ( while [ "$(date +%s)" -lt "$_ul_end" ]; do
                     dd if=/dev/zero bs=1048576 count=50 2>/dev/null | \
-                    curl -s -o /dev/null --max-time "$_ul_window" -X POST --data-binary @- "https://${_cf_host}/__up" 2>/dev/null
+                    curl -s -o /dev/null --max-time "$_ul_window" -X "$_ul_method" --data-binary @- "$_ul_url" 2>/dev/null
                   done ) &
                 _ul_pids+=("$!")
             done
             _ub0=$(_if_obytes); _ut0=$(_epoch_ms)
             while [ "$(date +%s)" -lt "$_ul_end" ]; do sleep 1; done
             _ub1=$(_if_obytes); _ut1=$(_epoch_ms)
-            kill "${_ul_pids[@]}" 2>/dev/null; pkill -f 'cloudflare.com/__up' 2>/dev/null; wait 2>/dev/null
+            kill "${_ul_pids[@]}" 2>/dev/null; pkill -f "$_cf_host" 2>/dev/null; wait 2>/dev/null
             _udb=0; _udt=0
             [[ "$_ub0" =~ ^[0-9]+$ ]] && [[ "$_ub1" =~ ^[0-9]+$ ]] && [[ "$_ub1" -ge "$_ub0" ]] && _udb=$(( _ub1 - _ub0 ))
             [[ "$_ut0" =~ ^[0-9]+$ ]] && [[ "$_ut1" =~ ^[0-9]+$ ]] && [[ "$_ut1" -gt "$_ut0" ]] && _udt=$(( _ut1 - _ut0 ))
