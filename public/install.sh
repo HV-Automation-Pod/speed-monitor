@@ -157,7 +157,7 @@ cat > "$PLIST" << PLIST_EOF
   <key>Label</key><string>com.speedmonitor</string>
   <key>ProgramArguments</key>
   <array><string>$BIN_DIR/speed_monitor.sh</string></array>
-  <key>StartInterval</key><integer>600</integer>
+  <key>StartInterval</key><integer>300</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$DATA_DIR/launchd_stdout.log</string>
   <key>StandardErrorPath</key><string>$DATA_DIR/launchd_stderr.log</string>
@@ -165,6 +165,11 @@ cat > "$PLIST" << PLIST_EOF
   <dict>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <!-- Marks launchd-scheduled runs so the client applies round-robin slotting
+         (each device speed-tests once per 20-min window in its own 5-min slot).
+         Fires every 5 min; the script decides whether it is this device's slot. -->
+    <key>SPEED_SCHEDULED</key>
+    <string>1</string>
   </dict>
 </dict>
 </plist>

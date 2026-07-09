@@ -2,6 +2,12 @@
 #
 # Speed Monitor v3.0.0 - Organization-Wide Internet Speed Monitoring
 # Enhanced data collection for fleet deployment (300+ devices)
+# v4.1.7: Corporate-egress accuracy. (1) Detect Cloudflare 429 on the REAL transfer
+#         (1 MB health probe misses it) → log status=rate_limited_429 instead of a wrong
+#         low number, and fall back to Ookla. (2) Round-robin scheduling: each device
+#         tests once per 20-min window in its own 5-min slot (SPEED_SCHEDULED plist), so
+#         the fleet stops hammering the shared egress. (3) Periodic Ookla runs tagged
+#         status=success_ookla. See _throughput_mbps / _slot_decision.
 # v4.1.6: Download/upload = SUSTAINED bytes/window (not peak-of-1s). Fixes the metric
 #         that inflated highs above the WAN rate and logged failed transfers as low
 #         "success" (the bimodal 0.45-5 vs 280-736 Mbps artifact). See _throughput_mbps.
@@ -12,7 +18,7 @@
 # v2.1.0: Added WiFi debugging metrics (MCS, error rates, BSSID tracking)
 #
 
-APP_VERSION="4.1.6"
+APP_VERSION="4.1.7"
 
 # Configuration
 DATA_DIR="$HOME/.local/share/nkspeedtest"
@@ -984,6 +990,35 @@ _throughput_mbps() {
 }
 # >>>THROUGHPUT_HELPER_END
 
+# >>>SCHEDULE_HELPERS_START (self-contained; unit-tested by tests/test_schedule.sh)
+# Round-robin scheduling. The fleet shares a few corporate/Zscaler egress IPs; when all
+# devices speed-test at once, Cloudflare 429-rate-limits that IP and readings go wrong.
+# So each device tests once per window, in its own deterministic slot, spreading load.
+#
+# _device_slot <device_id> <num_slots> -> stable slot 0..num_slots-1 for this device.
+_device_slot() {
+    local _id="$1" _n="$2" _h
+    [[ "$_n" =~ ^[0-9]+$ ]] && [[ "$_n" -gt 0 ]] || { echo 0; return; }
+    _h=$(printf '%s' "$_id" | cksum | awk '{print $1}')
+    [[ "$_h" =~ ^[0-9]+$ ]] || _h=0
+    echo $(( _h % _n ))
+}
+
+# Decide whether a SCHEDULED run should test now. Echoes "RUN" or "SKIP".
+# Args: <my_slot> <cur_slot> <last_age_sec> <window_sec> <slot_sec>
+# Rules: never test twice within one window; otherwise run in this device's own slot;
+# a stale device (age >= window + 2*slot) runs regardless so none goes silent even if
+# launchd fires coarser than one slot (e.g. old 10-min plists before reinstall).
+_slot_decision() {
+    local _my="$1" _cur="$2" _age="$3" _win="$4" _slot="$5"
+    [[ "$_age" =~ ^[0-9]+$ ]] || { echo "RUN"; return; }
+    [[ "$_age" -ge "$_win" ]] || { echo "SKIP"; return; }
+    [[ "$_my" == "$_cur" ]] && { echo "RUN"; return; }
+    [[ "$_age" -ge $(( _win + 2 * _slot )) ]] && { echo "RUN"; return; }
+    echo "SKIP"
+}
+# >>>SCHEDULE_HELPERS_END
+
 # Escape string for JSON (handle quotes, backslashes, newlines)
 json_escape() {
     local str="$1"
@@ -1127,12 +1162,34 @@ poll_edge_commands() {
 collect_metrics() {
     local errors=""
     STATUS="pending"  # Initialize status
+    local CF_RATELIMITED=0   # set if Cloudflare 429s the shared egress on the real transfer
 
     log "Starting speed test (v$APP_VERSION)..."
 
     # Timestamp and device info
     TIMESTAMP_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     DEVICE_ID=$(get_device_id)
+
+    # Round-robin scheduling (SCHEDULED runs only — the plist sets SPEED_SCHEDULED=1;
+    # manual/menu-bar runs are never gated). Each device speed-tests once per
+    # SPEED_WINDOW_MIN, in its own SPEED_SLOT_MIN slot, so the fleet staggers instead of
+    # all hitting the shared (rate-limited) egress at once. Disable with SPEED_ROUND_ROBIN=0.
+    if [[ "${SPEED_SCHEDULED:-0}" == "1" && "${SPEED_ROUND_ROBIN:-1}" == "1" ]]; then
+        local _win_min="${SPEED_WINDOW_MIN:-20}" _slot_min="${SPEED_SLOT_MIN:-5}"
+        local _nslots=$(( _win_min / _slot_min )); [[ "$_nslots" -lt 1 ]] && _nslots=1
+        local _now _last _age _my_slot _cur_slot _lastfile="$DATA_DIR/last_speedtest_ts"
+        _now=$(date +%s)
+        _my_slot=$(_device_slot "$DEVICE_ID" "$_nslots")
+        _cur_slot=$(( ( _now / 60 % _win_min ) / _slot_min ))
+        _last=$(cat "$_lastfile" 2>/dev/null); [[ "$_last" =~ ^[0-9]+$ ]] || _last=0
+        _age=$(( _now - _last )); [[ "$_age" -lt 0 ]] && _age=999999
+        if [[ "$(_slot_decision "$_my_slot" "$_cur_slot" "$_age" "$(( _win_min * 60 ))" "$(( _slot_min * 60 ))")" == "SKIP" ]]; then
+            log "Round-robin: not this device's slot (my=$_my_slot cur=$_cur_slot age=${_age}s) — skipping run"
+            return 0
+        fi
+        log "Round-robin: this device's slot (my=$_my_slot of $_nslots, cur=$_cur_slot, age=${_age}s) — running"
+    fi
+
     OS_VERSION=$(sw_vers -productVersion 2>/dev/null || echo "unknown")
     TIMEZONE=$(date +"%z")
 
@@ -1330,13 +1387,23 @@ collect_metrics() {
 
     local speedtest_success=false
 
+    # Occasional Ookla (speedtest-cli) run for an accurate, un-rate-limited cross-check,
+    # tagged source=ookla. ~1-in-N scheduled runs skip Cloudflare and use Ookla, which
+    # hits its own nearby servers and isn't subject to Cloudflare's per-IP 429 on the
+    # shared corporate egress. Set SPEED_OOKLA_EVERY=0 to disable.
+    local _ookla_every="${SPEED_OOKLA_EVERY:-6}"
+    local _use_ookla=0
+    if [[ "$_ookla_every" =~ ^[0-9]+$ ]] && [[ "$_ookla_every" -gt 0 ]] && command -v speedtest-cli &>/dev/null; then
+        [[ $(( RANDOM % _ookla_every )) -eq 0 ]] && _use_ookla=1 && log "This run will use Ookla (1-in-${_ookla_every})"
+    fi
+
     # Strategy 1 (PRIMARY): Cloudflare — measure true wire throughput from the
     # interface byte counters (netstat -ib), the same mechanism the app's live
     # meter uses. curl's own speed numbers are unreliable through Zscaler
     # (download under-reads during TCP slow-start; upload over-reads into the
     # local proxy buffer). Counting actual bytes on the wire over a sustained
     # 4-stream transfer matches Ookla closely (validated against Ookla Chennai).
-    if [[ "$speedtest_success" == "false" ]]; then
+    if [[ "$speedtest_success" == "false" && "$_use_ookla" != "1" ]]; then
         local _cf_host="speed.cloudflare.com"
 
         # Active interface (default route); fall back to en0
@@ -1420,10 +1487,24 @@ collect_metrics() {
         [[ "$_t0" =~ ^[0-9]+$ ]] && [[ "$_t1" =~ ^[0-9]+$ ]] && [[ "$_t1" -gt "$_t0" ]] && _dt=$(( _t1 - _t0 ))
         _dl_result=$(_throughput_mbps "$_db" "$_dt" "$_dl_min_bytes" "$_dl_min_ms" "$_max_mbps")
 
-        if [[ ! "$_dl_http" =~ ^2[0-9][0-9]$ ]]; then
-            # Rate-limited / blocked endpoint — do NOT record; let the fallbacks try.
-            log "Download endpoint HTTP ${_dl_http:-000} (rate-limited/blocked) — discarding measurement, trying fallbacks"
-            errors="${errors:+$errors;}cf_download_http_${_dl_http:-000}"
+        # Confirm rate-limiting on the REAL transfer. The 1 MB health probe above is too
+        # small to trip Cloudflare's per-IP 429 that throttles the shared corporate egress
+        # (observed live: 1 MB probe = 200, 25 MB transfer = 429). So a low/invalid reading
+        # gets one representative re-probe; a 429/403/5xx there means the endpoint is
+        # throttling us, not a slow link — and we must not record a bogus low number.
+        local _dl_http2=""
+        if [[ "$_dl_result" == "INVALID" ]] || awk "BEGIN{exit !((${_dl_result}+0) < ${SPEED_RL_CHECK_MBPS:-50})}" 2>/dev/null; then
+            _dl_http2=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "https://${_cf_host}/__down?bytes=25000000" 2>/dev/null)
+            [[ "$_dl_http2" =~ ^(429|403|5[0-9][0-9])$ ]] && CF_RATELIMITED=1
+        fi
+
+        if [[ ! "$_dl_http" =~ ^2[0-9][0-9]$ ]] || [[ "$CF_RATELIMITED" == "1" ]]; then
+            # Endpoint rate-limited/blocked (shared corporate egress). Do NOT record a
+            # bogus low download — leave speedtest_success=false so Ookla (speedtest-cli)
+            # runs, and remember the 429 so it is logged instead of wrong data.
+            log "Download rate-limited/blocked (probe=${_dl_http:-000}, confirm=${_dl_http2:-n/a}) — discarding, trying Ookla"
+            errors="${errors:+$errors;}cf_download_429_${_dl_http2:-${_dl_http:-000}}"
+            CF_RATELIMITED=1
         elif [[ "$_dl_result" == "INVALID" ]]; then
             # Near-zero / failed transfer (below the byte floor, or window did not run).
             # Do NOT record a low download — that is the bug being fixed. Leave
@@ -1508,7 +1589,7 @@ collect_metrics() {
                         [[ "$_lk" =~ ^[A-Z_]+$ ]] && printf -v "$_lk" '%s' "$_lv"
                     done < <(measure_latency_ms)
                 fi
-                STATUS="success"
+                STATUS="success_ookla"
                 speedtest_success=true
                 log "Strategy 1 succeeded - Down: ${DOWNLOAD_MBPS} Mbps, Up: ${UPLOAD_MBPS} Mbps, Lat: ${LATENCY_MS}ms"
             else
@@ -1554,7 +1635,7 @@ collect_metrics() {
                         [[ "$_lk" =~ ^[A-Z_]+$ ]] && printf -v "$_lk" '%s' "$_lv"
                     done < <(measure_latency_ms)
                 fi
-                STATUS="success"
+                STATUS="success_ookla"
                 speedtest_success=true
                 log "Strategy 2 succeeded - Down: ${DOWNLOAD_MBPS} Mbps, Up: ${UPLOAD_MBPS} Mbps, Lat: ${LATENCY_MS}ms"
             else
@@ -1608,7 +1689,14 @@ collect_metrics() {
         DOWNLOAD_MBPS="0"
         UPLOAD_MBPS="0"
 
-        if [[ "$VPN_STATUS" == "connected" ]]; then
+        if [[ "$CF_RATELIMITED" == "1" ]]; then
+            # Cloudflare 429-throttled the shared corporate egress AND Ookla was
+            # unavailable. Log the rate-limit STATUS (0 speeds) so the sheet records
+            # "429", not a wrong low number — the dashboard excludes these from medians.
+            STATUS="rate_limited_429"
+            errors="${errors:+$errors;}cf_rate_limited_no_fallback"
+            log "Rate-limited (429) with no Ookla fallback — logging status=rate_limited_429 (0 speeds, excluded from stats)"
+        elif [[ "$VPN_STATUS" == "connected" ]]; then
             STATUS="vpn_blocked"
             errors="vpn_blocking_speedtest"
             log "All speed test strategies failed with VPN. Corporate firewall likely blocking."
@@ -1712,6 +1800,9 @@ collect_metrics() {
     printf 'DOWNLOAD_MBPS=%s\nUPLOAD_MBPS=%s\nLATENCY_MS=%s\nJITTER_MS=%s\nTIMESTAMP=%s\n' \
         "$DOWNLOAD_MBPS" "$UPLOAD_MBPS" "$LATENCY_MS" "$JITTER_MS" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$_tmp_result"
     mv "$_tmp_result" "$_result_file"
+
+    # Stamp last-test time so the round-robin gate knows this device tested this window.
+    date +%s > "$DATA_DIR/last_speedtest_ts" 2>/dev/null || true
 
     log "Test completed"
 }
