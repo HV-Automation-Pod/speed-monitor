@@ -2,6 +2,9 @@
 #
 # Speed Monitor v3.0.0 - Organization-Wide Internet Speed Monitoring
 # Enhanced data collection for fleet deployment (300+ devices)
+# v4.1.10: Complete rows on the Ookla path. Ookla reports latency only, so jitter, jitter
+#          percentiles and packet loss were logging as 0. measure_net_quality() now fills
+#          them via an ICMP ping (SPEED_PING_TARGET, default 1.1.1.1) on Ookla runs.
 # v4.1.9: Free trustworthy download by default. When NO custom origin (SPEED_DL_URL) is
 #         set, use Ookla (speedtest-cli) as PRIMARY instead of Cloudflare — free, no infra,
 #         not 429'd on the shared egress. SPEED_OOKLA_SERVER=<id> pins a nearby server if
@@ -27,7 +30,7 @@
 # v2.1.0: Added WiFi debugging metrics (MCS, error rates, BSSID tracking)
 #
 
-APP_VERSION="4.1.9"
+APP_VERSION="4.1.10"
 
 # Configuration
 DATA_DIR="$HOME/.local/share/nkspeedtest"
@@ -808,6 +811,22 @@ track_bssid_changes() {
 # The gateway is local — always reachable, bypasses VPN/Zscaler, measures
 # WiFi link quality rather than internet path.
 # Outputs: LATENCY_MS=X JITTER_MS=X
+# Populate LATENCY_MS/JITTER_MS/JITTER_P50/JITTER_P95/PACKET_LOSS_PCT from an ICMP ping to
+# a stable internet target. Ookla returns latency but NO jitter/loss, so the Ookla path
+# calls this to keep rows complete. Returns 1 if ICMP is blocked (no "avg" summary line).
+measure_net_quality() {
+    local _t="${1:-1.1.1.1}" _full _last _loss
+    _full=$(ping -c 10 -q "$_t" 2>/dev/null)
+    _last=$(echo "$_full" | tail -1)
+    echo "$_last" | grep -q "avg" || return 1
+    _loss=$(echo "$_full" | grep -oE '[0-9.]+% packet loss' | grep -oE '^[0-9.]+' | head -1)
+    [[ -n "$_loss" ]] && PACKET_LOSS_PCT="$_loss"
+    LATENCY_MS=$(echo "$_last" | awk -F'[=/]' '{printf "%.1f", $(NF-2)}')
+    JITTER_MS=$(echo "$_last"  | awk -F'[=/]' '{printf "%.2f", $(NF)}')
+    JITTER_P50="$JITTER_MS"; JITTER_P95="$JITTER_MS"
+    return 0
+}
+
 measure_latency_ms() {
     local gateway
     gateway=$(route get default 2>/dev/null | awk '/gateway:/{print $2; exit}')
@@ -1626,14 +1645,16 @@ collect_metrics() {
                 # Sanity-cap at 2000ms — if Zscaler spoofs the value, fall back to gateway ping.
                 local _cli_ping
                 _cli_ping=$(echo "$speedtest_output" | grep "Ping:" | awk '{print $2}')
-                if is_positive_number "${_cli_ping:-}" && \
-                   awk "BEGIN{exit !($_cli_ping < 2000)}" 2>/dev/null; then
-                    LATENCY_MS="$_cli_ping"
-                    JITTER_MS="0"
-                else
+                # Jitter + packet loss via ICMP (Ookla reports latency only). Fall back to
+                # a gateway ping if ICMP is blocked; then prefer Ookla's server latency
+                # while keeping the ICMP jitter/loss so the row is complete.
+                measure_net_quality "${SPEED_PING_TARGET:-1.1.1.1}" || \
                     while IFS='=' read -r _lk _lv; do
                         [[ "$_lk" =~ ^[A-Z_]+$ ]] && printf -v "$_lk" '%s' "$_lv"
                     done < <(measure_latency_ms)
+                if is_positive_number "${_cli_ping:-}" && \
+                   awk "BEGIN{exit !($_cli_ping < 2000)}" 2>/dev/null; then
+                    LATENCY_MS="$_cli_ping"
                 fi
                 STATUS="success_ookla"
                 speedtest_success=true
@@ -1672,14 +1693,13 @@ collect_metrics() {
                 UPLOAD_MBPS=$(echo "$speedtest_output"  | grep "Upload:"   | awk '{print $2}')
                 local _cli_ping2
                 _cli_ping2=$(echo "$speedtest_output" | grep "Ping:" | awk '{print $2}')
-                if is_positive_number "${_cli_ping2:-}" && \
-                   awk "BEGIN{exit !($_cli_ping2 < 2000)}" 2>/dev/null; then
-                    LATENCY_MS="$_cli_ping2"
-                    JITTER_MS="0"
-                else
+                measure_net_quality "${SPEED_PING_TARGET:-1.1.1.1}" || \
                     while IFS='=' read -r _lk _lv; do
                         [[ "$_lk" =~ ^[A-Z_]+$ ]] && printf -v "$_lk" '%s' "$_lv"
                     done < <(measure_latency_ms)
+                if is_positive_number "${_cli_ping2:-}" && \
+                   awk "BEGIN{exit !($_cli_ping2 < 2000)}" 2>/dev/null; then
+                    LATENCY_MS="$_cli_ping2"
                 fi
                 STATUS="success_ookla"
                 speedtest_success=true
