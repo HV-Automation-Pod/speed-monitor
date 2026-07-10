@@ -2,6 +2,10 @@
 #
 # Speed Monitor v3.0.0 - Organization-Wide Internet Speed Monitoring
 # Enhanced data collection for fleet deployment (300+ devices)
+# v4.1.9: Free trustworthy download by default. When NO custom origin (SPEED_DL_URL) is
+#         set, use Ookla (speedtest-cli) as PRIMARY instead of Cloudflare — free, no infra,
+#         not 429'd on the shared egress. SPEED_OOKLA_SERVER=<id> pins a nearby server if
+#         auto-selection lands far (Zscaler egress geolocation). Custom origin still wins.
 # v4.1.8: Trustworthy throughput. (1) Configurable test origin — SPEED_DL_URL/SPEED_UL_URL
 #         point at an origin NOT fronted by a CDN (own S3 object / VM), so the shared
 #         Zscaler egress isn't 429-rate-limited by Cloudflare (falls back with a warning).
@@ -23,7 +27,7 @@
 # v2.1.0: Added WiFi debugging metrics (MCS, error rates, BSSID tracking)
 #
 
-APP_VERSION="4.1.8"
+APP_VERSION="4.1.9"
 
 # Configuration
 DATA_DIR="$HOME/.local/share/nkspeedtest"
@@ -1402,14 +1406,23 @@ collect_metrics() {
 
     local speedtest_success=false
 
-    # Occasional Ookla (speedtest-cli) run for an accurate, un-rate-limited cross-check,
-    # tagged source=ookla. ~1-in-N scheduled runs skip Cloudflare and use Ookla, which
-    # hits its own nearby servers and isn't subject to Cloudflare's per-IP 429 on the
-    # shared corporate egress. Set SPEED_OOKLA_EVERY=0 to disable.
+    # Download strategy. Cloudflare 429-rate-limits the shared corporate/Zscaler egress,
+    # so measuring against it is meaningless. Ookla (speedtest-cli) uses its own nearby
+    # servers (NOT Cloudflare), works on corporate, and is free. So: when NO custom origin
+    # (SPEED_DL_URL / config file) is set, use Ookla as PRIMARY — no infra, no cost, no 429.
+    # When a custom non-CDN origin IS set, the bytes/window method uses it and Ookla runs
+    # only as a ~1-in-N cross-check. SPEED_OOKLA_EVERY=0 disables that cross-check;
+    # SPEED_OOKLA_SERVER=<id> pins a nearby server if auto-selection lands far away.
     local _ookla_every="${SPEED_OOKLA_EVERY:-6}"
-    local _use_ookla=0
-    if [[ "$_ookla_every" =~ ^[0-9]+$ ]] && [[ "$_ookla_every" -gt 0 ]] && command -v speedtest-cli &>/dev/null; then
-        [[ $(( RANDOM % _ookla_every )) -eq 0 ]] && _use_ookla=1 && log "This run will use Ookla (1-in-${_ookla_every})"
+    local _use_ookla=0 _has_origin=0
+    [[ -n "${SPEED_DL_URL:-}" || -s "$CONFIG_DIR/dl_url" ]] && _has_origin=1
+    if command -v speedtest-cli &>/dev/null; then
+        if [[ "$_has_origin" == "0" ]]; then
+            _use_ookla=1
+            log "No custom test origin set — using Ookla as primary (free; Cloudflare would 429 the shared egress)"
+        elif [[ "$_ookla_every" =~ ^[0-9]+$ ]] && [[ "$_ookla_every" -gt 0 ]] && [[ $(( RANDOM % _ookla_every )) -eq 0 ]]; then
+            _use_ookla=1; log "This run will use Ookla (1-in-${_ookla_every} cross-check)"
+        fi
     fi
 
     # Strategy 1 (PRIMARY): Cloudflare — measure true wire throughput from the
@@ -1590,7 +1603,7 @@ collect_metrics() {
         local tmp_output=$(mktemp)
 
         # Run speedtest with timeout (macOS-compatible)
-        speedtest-cli --secure --simple > "$tmp_output" 2>&1 &
+        speedtest-cli --secure --simple ${SPEED_OOKLA_SERVER:+--server "$SPEED_OOKLA_SERVER"} > "$tmp_output" 2>&1 &
         local pid=$!
         local count=0
         while kill -0 $pid 2>/dev/null && [[ $count -lt 90 ]]; do
@@ -1638,7 +1651,7 @@ collect_metrics() {
         local tmp_output=$(mktemp)
 
         # Run speedtest with timeout (macOS-compatible)
-        speedtest-cli --simple > "$tmp_output" 2>&1 &
+        speedtest-cli --simple ${SPEED_OOKLA_SERVER:+--server "$SPEED_OOKLA_SERVER"} > "$tmp_output" 2>&1 &
         local pid=$!
         local count=0
         while kill -0 $pid 2>/dev/null && [[ $count -lt 90 ]]; do
